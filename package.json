@@ -27,6 +27,7 @@
   "files": [
     "bin/claude-p.js",
     "scripts/install.js",
+    "zig-out/bin/",
     "README.md",
     "LICENSE"
   ],
