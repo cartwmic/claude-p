@@ -83,6 +83,10 @@ pub const RunError = error{
     TranscriptUnavailable,
     SpawnFailed,
     NoPromptSupplied,
+    // custom: the typed prompt never echoed back into Ink's input box within
+    // the bounded retype budget (input dropped by a not-yet-ready TUI). Fail
+    // fast instead of waiting --timeout for a Stop hook that can never fire.
+    PromptNotAccepted,
 } || std.mem.Allocator.Error;
 
 /// Build the argv for the child `claude` invocation.
@@ -201,6 +205,18 @@ const ink_max_wait_ms: u64 = 2000;
 /// Ink's bracketed-paste heuristic merges back-to-back writes; without a
 /// gap, `\r` lands in the input buffer instead of triggering submit.
 const ink_enter_debounce_ms: u64 = 120;
+
+// --- custom (echo-confirmed input) ---
+// After typing the prompt, confirm it actually echoed into Ink's input box
+// before committing Enter, instead of trusting a blind debounce. Under
+// concurrent-boot CPU contention the SessionStart hook can fire while Ink's
+// input pipeline is not yet ready; the keystrokes are then dropped, the turn
+// never starts, and no Stop hook ever fires — the wrapper wedges until
+// --timeout. We poll the rolling `recent` PTY buffer for the prompt echo,
+// clear-line + retype on a miss, and fail fast rather than wedge.
+const echo_confirm_window_ms: u64 = 750; // per-attempt wait for the echo
+const echo_confirm_max_attempts: usize = 3;
+const echo_needle_max: usize = 48; // alnum chars of the prompt used as the echo needle
 
 /// Block until the child PTY has been quiet for at least `ink_quiescence_ms`,
 /// up to a cap of `ink_max_wait_ms`. Replaces the hardcoded "give Ink time
@@ -510,18 +526,54 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
                                 // ones get up to ink_max_wait_ms before we
                                 // give up and type anyway.
                                 waitForInkQuiescent(opts, trace_start, &shared);
-                                traceFmt(opts, trace_start, "typing prompt ({d} bytes)", .{opts.prompt.len});
 
-                                // Send prompt body, sleep, then Enter as a
-                                // separate event. Ink applies bracketed-paste
-                                // / burst-input heuristics: if `\r` arrives
-                                // in the same burst as the prompt, it lands
-                                // in the input buffer instead of triggering
-                                // submit. The gap makes Ink see two events.
-                                session.send(opts.prompt, false) catch {};
+                                // custom (echo-confirmed input): type the
+                                // prompt, then CONFIRM it echoed into Ink's
+                                // input box before committing Enter. Prompt and
+                                // `\r` are still sent as two events (Ink's
+                                // bracketed-paste heuristic merges back-to-back
+                                // writes, so a same-burst `\r` would land in the
+                                // buffer instead of submitting). Under
+                                // concurrent-boot contention the keystrokes can
+                                // be dropped by a not-yet-ready TUI; retype
+                                // (clear-line first, so a partial can't
+                                // concatenate) up to echo_confirm_max_attempts,
+                                // then fail fast rather than wedge until
+                                // --timeout for a Stop that can never come.
+                                var attempt: usize = 0;
+                                var confirmed = false;
+                                while (attempt < echo_confirm_max_attempts and !confirmed) : (attempt += 1) {
+                                    if (attempt > 0) {
+                                        // Ctrl-U kills the input line so a
+                                        // partially-accepted prior attempt
+                                        // cannot concatenate into a corrupt prompt.
+                                        session.send("\x15", false) catch {};
+                                        std.Thread.sleep(40 * std.time.ns_per_ms);
+                                    }
+                                    traceFmt(opts, trace_start, "typing prompt ({d} bytes), attempt {d}", .{ opts.prompt.len, attempt + 1 });
+                                    session.send(opts.prompt, false) catch {};
+
+                                    const echo_window_ns: i64 = @intCast(echo_confirm_window_ms * std.time.ns_per_ms);
+                                    const echo_wait_start: i64 = @intCast(std.time.nanoTimestamp());
+                                    while (true) {
+                                        if (promptEchoConfirmed(allocator, &shared, opts.prompt) catch false) {
+                                            confirmed = true;
+                                            break;
+                                        }
+                                        const echo_now: i64 = @intCast(std.time.nanoTimestamp());
+                                        if (echo_now - echo_wait_start > echo_window_ns) break;
+                                        std.Thread.sleep(25 * std.time.ns_per_ms);
+                                    }
+                                }
+
+                                if (!confirmed) {
+                                    traceFmt(opts, trace_start, "prompt echo never confirmed after {d} attempt(s) — failing fast (PromptNotAccepted)", .{echo_confirm_max_attempts});
+                                    return RunError.PromptNotAccepted;
+                                }
+
                                 std.Thread.sleep(ink_enter_debounce_ms * std.time.ns_per_ms);
                                 session.send("", true) catch {};
-                                trace(opts, trace_start, "prompt + Enter sent; waiting on claude API");
+                                trace(opts, trace_start, "prompt echo confirmed; Enter sent; waiting on claude API");
 
                                 state = .awaiting_stop;
                             }
@@ -734,6 +786,44 @@ fn stripCsi(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
         }
     }
     return try out.toOwnedSlice(allocator);
+}
+
+/// custom: copy only the ASCII alphanumeric bytes of `src` (drops spaces,
+/// punctuation, and any residual control bytes). Used to compare the prompt
+/// against its echo robustly across Ink's wrapping / CSI padding / spacing.
+fn alnumCopy(allocator: std.mem.Allocator, src: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .{};
+    errdefer out.deinit(allocator);
+    for (src) |c| {
+        if ((c >= '0' and c <= '9') or (c >= 'A' and c <= 'Z') or (c >= 'a' and c <= 'z')) {
+            try out.append(allocator, c);
+        }
+    }
+    return try out.toOwnedSlice(allocator);
+}
+
+/// custom: has the typed prompt echoed back into the PTY output captured in
+/// `recent`? Compares an alnum-only projection of both sides so spaces,
+/// escapes, and line-wrapping inserted by Ink don't defeat the match. Returns
+/// true when the prompt has no alnum content (nothing distinctive to confirm —
+/// don't block such prompts).
+fn promptEchoConfirmed(allocator: std.mem.Allocator, shared: *SharedState, prompt: []const u8) !bool {
+    const needle_full = try alnumCopy(allocator, prompt);
+    defer allocator.free(needle_full);
+    if (needle_full.len == 0) return true;
+    const needle = needle_full[0..@min(needle_full.len, echo_needle_max)];
+
+    shared.recent_mutex.lock();
+    const stripped = stripCsi(allocator, shared.recent.items) catch {
+        shared.recent_mutex.unlock();
+        return false;
+    };
+    shared.recent_mutex.unlock();
+    defer allocator.free(stripped);
+
+    const hay = try alnumCopy(allocator, stripped);
+    defer allocator.free(hay);
+    return std.mem.indexOf(u8, hay, needle) != null;
 }
 
 // -------- tests --------
