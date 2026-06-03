@@ -30,8 +30,9 @@
     "README.md",
     "LICENSE"
   ],
+  "claudePPatch": "echo-confirm-input",
   "scripts": {
-    "postinstall": "node scripts/install.js",
+    "prepare": "zig build -Doptimize=ReleaseSafe",
     "test": "zig build test",
     "build": "zig build -Doptimize=ReleaseSafe",
     "release": "node scripts/publish.mjs",
