@@ -802,9 +802,32 @@ fn alnumCopy(allocator: std.mem.Allocator, src: []const u8) ![]u8 {
     return try out.toOwnedSlice(allocator);
 }
 
+/// custom: the marker Claude Code renders INSTEAD of echoing a large/multi-line
+/// paste. Above a size/line threshold it collapses the input into placeholders
+/// like "[Pasted text #1 +30 lines][Pasted text #2 +29 lines]" and never echoes
+/// the literal text — so the needle below can never match for big prompts (e.g.
+/// the bridge's bundled system prompt). The collapse is DISPLAY-ONLY: Enter
+/// still submits the full content. So the placeholder's presence after we typed
+/// is itself proof the input was accepted, and counts as echo confirmation.
+const paste_collapse_marker = "Pasted text";
+
+/// custom: does the typed prompt's echo (literal, or its paste-collapse
+/// placeholder) appear in the recent PTY output? Pure, so it is unit-testable.
+///   - `hay_alnum`: alnum-only projection of the CSI-stripped recent buffer
+///   - `needle`:    alnum-only projection of the prompt's first echo_needle_max chars
+///   - `stripped`:  CSI-stripped recent buffer, NOT alnum-projected (keeps the
+///                  space in the `paste_collapse_marker`)
+fn echoConfirms(hay_alnum: []const u8, needle: []const u8, stripped: []const u8) bool {
+    if (needle.len == 0) return true; // nothing distinctive to confirm — don't block
+    if (std.mem.indexOf(u8, hay_alnum, needle) != null) return true; // literal echo (small prompts)
+    if (std.mem.indexOf(u8, stripped, paste_collapse_marker) != null) return true; // collapsed paste (large prompts)
+    return false;
+}
+
 /// custom: has the typed prompt echoed back into the PTY output captured in
 /// `recent`? Compares an alnum-only projection of both sides so spaces,
-/// escapes, and line-wrapping inserted by Ink don't defeat the match. Returns
+/// escapes, and line-wrapping inserted by Ink don't defeat the match; also
+/// accepts Claude Code's paste-collapse placeholder (see echoConfirms). Returns
 /// true when the prompt has no alnum content (nothing distinctive to confirm —
 /// don't block such prompts).
 fn promptEchoConfirmed(allocator: std.mem.Allocator, shared: *SharedState, prompt: []const u8) !bool {
@@ -823,12 +846,32 @@ fn promptEchoConfirmed(allocator: std.mem.Allocator, shared: *SharedState, promp
 
     const hay = try alnumCopy(allocator, stripped);
     defer allocator.free(hay);
-    return std.mem.indexOf(u8, hay, needle) != null;
+    return echoConfirms(hay, needle, stripped);
 }
 
 // -------- tests --------
 
 const testing = std.testing;
+
+test "echoConfirms: literal echo matches (small prompt)" {
+    // Needle (alnum of prompt start) appears in the alnum-projected hay.
+    try testing.expect(echoConfirms("xxHELLOWORLDxx", "HELLOWORLD", "xx HELLO WORLD xx"));
+}
+
+test "echoConfirms: paste-collapse placeholder counts as confirmation" {
+    // Large prompt: literal needle is ABSENT (Claude Code never echoes it), but
+    // the "[Pasted text #N +M lines]" placeholder is present → accepted.
+    const stripped = "\xe2\x9d\xaf [Pasted text #1 +30 lines][Pasted text #2 +29 lines]";
+    try testing.expect(echoConfirms("someunrelatedchrome", "NEEDLESTARTabc", stripped));
+}
+
+test "echoConfirms: neither literal echo nor placeholder → not confirmed" {
+    try testing.expect(!echoConfirms("unrelatedoutput", "NEEDLESTART", "just some prompt text here"));
+}
+
+test "echoConfirms: empty needle → confirmed (nothing distinctive to match)" {
+    try testing.expect(echoConfirms("", "", ""));
+}
 
 test "buildArgv: minimal" {
     var argv = try buildArgv(testing.allocator, "/bin/claude", "{}", .{
