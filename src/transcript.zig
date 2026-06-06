@@ -203,6 +203,18 @@ pub fn parseFile(allocator: std.mem.Allocator, path: []const u8) !Summary {
     return parse(allocator, bytes);
 }
 
+/// Count of assistant turns currently recorded in the transcript file, or 0 if
+/// the file is absent or has no assistant message yet. Used as the
+/// resume-staleness baseline: the live turn must push this count higher before
+/// claude-p trusts a parsed result — otherwise a parse reflects a REPLAYED
+/// prior turn (the `--resume` stale-result race). Best-effort; never throws.
+pub fn turnCountFile(allocator: std.mem.Allocator, path: ?[]const u8) u32 {
+    const p = path orelse return 0;
+    var s = parseFile(allocator, p) catch return 0;
+    defer s.deinit(allocator);
+    return s.num_turns;
+}
+
 // -------- tests --------
 
 const testing = std.testing;
@@ -296,6 +308,38 @@ test "parse: replay preserves lines verbatim" {
     // jsonl_replay should be the input with each non-empty line followed by \n.
     try testing.expect(std.mem.indexOf(u8, s.jsonl_replay, "\"subtype\":\"init\"") != null);
     try testing.expect(std.mem.indexOf(u8, s.jsonl_replay, "\"text\":\"hi\"") != null);
+}
+
+test "resume staleness: num_turns distinguishes a replayed prior turn from the live turn" {
+    // A resumed transcript that still ends at the PRIOR turn. parse() returns
+    // the prior answer as final_text (this is the stale-result HAZARD the gate
+    // must not emit) and num_turns == 1 (the baseline the live turn must exceed).
+    const prior_only =
+        \\{"type":"system","subtype":"init","sessionId":"s"}
+        \\{"type":"user","sessionId":"s","message":{"content":[{"type":"text","text":"capital of France?"}]}}
+        \\{"type":"assistant","sessionId":"s","message":{"content":[{"type":"text","text":"Paris"}]}}
+        \\
+    ;
+    var before = try parse(testing.allocator, prior_only);
+    defer before.deinit(testing.allocator);
+    try testing.expectEqualStrings("Paris", before.final_text); // hazard: last assistant is the PRIOR answer
+    try testing.expectEqual(@as(u32, 1), before.num_turns); // baseline = 1
+
+    // After the live turn lands, num_turns grows and final_text is the LIVE
+    // answer. The driver's gate accepts only when num_turns > baseline.
+    const with_live =
+        \\{"type":"system","subtype":"init","sessionId":"s"}
+        \\{"type":"user","sessionId":"s","message":{"content":[{"type":"text","text":"capital of France?"}]}}
+        \\{"type":"assistant","sessionId":"s","message":{"content":[{"type":"text","text":"Paris"}]}}
+        \\{"type":"user","sessionId":"s","message":{"content":[{"type":"text","text":"what is 2+2?"}]}}
+        \\{"type":"assistant","sessionId":"s","message":{"content":[{"type":"text","text":"4"}]}}
+        \\
+    ;
+    var after = try parse(testing.allocator, with_live);
+    defer after.deinit(testing.allocator);
+    try testing.expectEqualStrings("4", after.final_text); // live answer
+    try testing.expectEqual(@as(u32, 2), after.num_turns); // grew past baseline
+    try testing.expect(after.num_turns > before.num_turns); // the guard's core invariant
 }
 
 test "parse: multi-block text concatenation" {
