@@ -58,6 +58,11 @@ pub const Options = struct {
     add_dirs: std.ArrayList([]const u8) = .{},
     /// `--mcp-config` may be repeated.
     mcp_configs: std.ArrayList([]const u8) = .{},
+    /// Optional MCP-readiness sentinel path. When set, the driver holds the
+    /// submit Enter until this file exists (the bridge's MCP shim creates it
+    /// once it has served tools/list). Consumed here so it is NOT forwarded to
+    /// `claude`, which does not understand it. See driver.Options.mcp_ready_file.
+    mcp_ready_file: ?[]const u8 = null,
 
     /// Arguments we don't recognize: passed through verbatim to `claude`.
     passthrough: std.ArrayList([]const u8) = .{},
@@ -126,6 +131,7 @@ const help_text =
     \\  --session-id <uuid>             Use a specific session UUID
     \\  --cwd <path>                    Working directory for `claude`
     \\  --input-file <path>             Read prompt from a file
+    \\  --mcp-ready-file <path>         Hold submit until this sentinel exists
     \\  --verbose                       Verbose output
     \\  --timeout <seconds>             Wrapper wall-time cap (default: 300)
     \\  --debug                         Wrapper debug logs to stderr
@@ -213,6 +219,10 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) ParseError!
             i += 1;
             if (i >= argv.len) return ParseError.MissingValue;
             opts.input_file = argv[i];
+        } else if (std.mem.eql(u8, a, "--mcp-ready-file")) {
+            i += 1;
+            if (i >= argv.len) return ParseError.MissingValue;
+            opts.mcp_ready_file = argv[i];
         } else if (std.mem.eql(u8, a, "--verbose")) {
             opts.verbose = true;
         } else if (std.mem.eql(u8, a, "--debug")) {
@@ -414,6 +424,18 @@ test "parse: --input-file" {
     var opts = try parse(testing.allocator, &.{ "--input-file", "/tmp/p.md" });
     defer opts.deinit(testing.allocator);
     try testing.expectEqualStrings("/tmp/p.md", opts.input_file.?);
+}
+
+test "parse: --mcp-ready-file is consumed (not forwarded to claude)" {
+    var opts = try parse(testing.allocator, &.{ "--mcp-ready-file", "/tmp/x.ready", "hi" });
+    defer opts.deinit(testing.allocator);
+    try testing.expectEqualStrings("/tmp/x.ready", opts.mcp_ready_file.?);
+    try testing.expectEqualStrings("hi", opts.prompt.?);
+    try testing.expectEqual(@as(usize, 0), opts.passthrough.items.len);
+}
+
+test "parse: --mcp-ready-file missing value" {
+    try testing.expectError(ParseError.MissingValue, parse(testing.allocator, &.{"--mcp-ready-file"}));
 }
 
 test "parse: known boolean passthrough flag does not consume next positional" {

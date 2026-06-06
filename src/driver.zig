@@ -32,6 +32,14 @@ pub const Options = struct {
     setting_sources: ?[]const u8 = null,
     add_dirs: []const []const u8 = &.{},
     mcp_configs: []const []const u8 = &.{},
+    /// Optional MCP-readiness sentinel. When set, the driver types the prompt as
+    /// soon as Ink is quiescent but HOLDS the submit Enter until this file
+    /// exists. The bridge's MCP shim creates it the moment it has served
+    /// `tools/list` — i.e. once the bridged tool surface is actually live in
+    /// `claude`. This closes the boot race where the prompt is submitted before
+    /// the MCP tools are registered, which makes the model emit tool calls as
+    /// raw text. Absent → submit as soon as the prompt echoes (legacy behavior).
+    mcp_ready_file: ?[]const u8 = null,
     verbose: bool = false,
     timeout_ms: u64 = 300_000,
     /// Override `claude` binary path (testing).
@@ -87,6 +95,11 @@ pub const RunError = error{
     // the bounded retype budget (input dropped by a not-yet-ready TUI). Fail
     // fast instead of waiting --timeout for a Stop hook that can never fire.
     PromptNotAccepted,
+    // custom: the MCP-readiness sentinel (Options.mcp_ready_file) never appeared
+    // within mcp_ready_max_wait_ms after the prompt echoed. We refuse to submit a
+    // prompt that would generate with NO bridged tools (the model would emit tool
+    // calls as text). Fail fast; the caller retries on a fresh spawn.
+    McpNotReady,
 } || std.mem.Allocator.Error;
 
 /// Build the argv for the child `claude` invocation.
@@ -217,6 +230,22 @@ const ink_enter_debounce_ms: u64 = 120;
 const echo_confirm_window_ms: u64 = 750; // per-attempt wait for the echo
 const echo_confirm_max_attempts: usize = 3;
 const echo_needle_max: usize = 48; // alnum chars of the prompt used as the echo needle
+
+// --- custom (MCP-readiness gate) ---
+// After the prompt echoes we HOLD the submit Enter until the MCP shim's
+// readiness sentinel (Options.mcp_ready_file) appears, so the turn never
+// generates before the bridged `mcp__custom-tools__*` surface is live in
+// `claude`. `claude` requests tools/list at boot, so the shim normally raises
+// this within ~1-2s; a miss means the shim died or never attached, and we fail
+// fast (McpNotReady) rather than submit a tool-less prompt or wedge to --timeout.
+const mcp_ready_max_wait_ms: u64 = 20_000;
+
+/// True if an absolute path exists and is accessible. Used to poll for the
+/// MCP-readiness sentinel without blocking the main loop.
+fn fileExists(path: []const u8) bool {
+    std.fs.accessAbsolute(path, .{}) catch return false;
+    return true;
+}
 
 /// Block until the child PTY has been quiet for at least `ink_quiescence_ms`,
 /// up to a cap of `ink_max_wait_ms`. Replaces the hardcoded "give Ink time
@@ -417,7 +446,12 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
     trace(opts, trace_start, "zmux session spawned; child claude PID up, Ink booting");
 
     const start_ns: i128 = trace_start;
-    var state: enum { waiting_for_ready, awaiting_stop } = .waiting_for_ready;
+    // waiting_for_ready  → before SessionStart / prompt typed
+    // waiting_for_mcp_ready → prompt is typed+echoed, Enter HELD pending the MCP
+    //   readiness sentinel (only entered when opts.mcp_ready_file is set)
+    // awaiting_stop      → Enter sent, waiting on the Stop hook
+    var state: enum { waiting_for_ready, waiting_for_mcp_ready, awaiting_stop } = .waiting_for_ready;
+    var mcp_ready_deadline_ns: i128 = 0;
     var first_emit_logged = false;
     var total_lines_streamed: usize = 0;
 
@@ -450,10 +484,30 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
         const elapsed_ms: u64 = @intCast(@divTrunc(now - start_ns, std.time.ns_per_ms));
         if (elapsed_ms > opts.timeout_ms) {
             if (state == .waiting_for_ready) return RunError.SessionStartTimeout;
+            if (state == .waiting_for_mcp_ready) return RunError.McpNotReady;
             return RunError.StopTimeout;
         }
-        if (shared.exited.load(.seq_cst) and state == .waiting_for_ready) {
+        if (shared.exited.load(.seq_cst) and
+            (state == .waiting_for_ready or state == .waiting_for_mcp_ready))
+        {
             return RunError.SpawnFailed;
+        }
+
+        // MCP-readiness gate: the prompt is typed and echoed; we hold the submit
+        // Enter here (the main loop keeps servicing the PTY) until the shim's
+        // sentinel appears, then submit. Fail fast if it never shows.
+        if (state == .waiting_for_mcp_ready) {
+            if (opts.mcp_ready_file) |rf| {
+                if (fileExists(rf)) {
+                    std.Thread.sleep(ink_enter_debounce_ms * std.time.ns_per_ms);
+                    session.send("", true) catch {};
+                    trace(opts, trace_start, "MCP surface ready; Enter sent; waiting on claude API");
+                    state = .awaiting_stop;
+                } else if (now > mcp_ready_deadline_ns) {
+                    traceFmt(opts, trace_start, "MCP readiness sentinel never appeared within {d}ms — failing fast (McpNotReady)", .{mcp_ready_max_wait_ms});
+                    return RunError.McpNotReady;
+                }
+            }
         }
 
         // Flush any DEC-responder bytes back to the PTY.
@@ -571,11 +625,21 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
                                     return RunError.PromptNotAccepted;
                                 }
 
-                                std.Thread.sleep(ink_enter_debounce_ms * std.time.ns_per_ms);
-                                session.send("", true) catch {};
-                                trace(opts, trace_start, "prompt echo confirmed; Enter sent; waiting on claude API");
-
-                                state = .awaiting_stop;
+                                // The prompt is in Ink's input box but NOT yet
+                                // submitted. When an MCP-readiness sentinel was
+                                // requested, hold the Enter until the bridged tool
+                                // surface is live (the main loop polls the file and
+                                // submits); otherwise submit immediately (legacy).
+                                if (opts.mcp_ready_file) |rf| {
+                                    mcp_ready_deadline_ns = std.time.nanoTimestamp() + @as(i128, @intCast(mcp_ready_max_wait_ms)) * std.time.ns_per_ms;
+                                    traceFmt(opts, trace_start, "prompt echo confirmed; holding Enter for MCP readiness (file={s})", .{rf});
+                                    state = .waiting_for_mcp_ready;
+                                } else {
+                                    std.Thread.sleep(ink_enter_debounce_ms * std.time.ns_per_ms);
+                                    session.send("", true) catch {};
+                                    trace(opts, trace_start, "prompt echo confirmed; Enter sent; waiting on claude API");
+                                    state = .awaiting_stop;
+                                }
                             }
                         },
                         .stop => {
