@@ -63,6 +63,20 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) ParseError!Summary
     var duration_api_ms: u64 = 0;
     var saw_assistant = false;
 
+    // Dedup `usage` by assistant message id. claude-p re-emits each assistant
+    // message 2-3x (streaming snapshots) and, on --resume, the transcript carries
+    // the full prior history — so summing every assistant line over-counts billing
+    // (observed: the total grew ~2x and climbed with session length). We count each
+    // DISTINCT message id's usage exactly once. Only `usage` is deduped; final_text,
+    // num_turns, and jsonl_replay still reflect every line (their consumers — the
+    // staleness gate and stream-json content — require the raw view).
+    var seen_ids = std.StringHashMap(void).init(allocator);
+    defer {
+        var key_it = seen_ids.keyIterator();
+        while (key_it.next()) |k| allocator.free(k.*);
+        seen_ids.deinit();
+    }
+
     var line_iter = std.mem.splitScalar(u8, bytes, '\n');
     while (line_iter.next()) |raw_line| {
         // Trim trailing \r and skip empty lines.
@@ -126,24 +140,43 @@ pub fn parse(allocator: std.mem.Allocator, bytes: []const u8) ParseError!Summary
                             }
                         }
                     }
-                    if (msg.object.get("usage")) |u| {
-                        if (u == .object) {
-                            if (u.object.get("input_tokens")) |x|
-                                if (x == .integer) {
-                                    usage.input_tokens +%= @intCast(x.integer);
+                    // Count this message's usage only the FIRST time we see its
+                    // id (collapse the re-emitted duplicates). A message with no
+                    // id (never observed in practice) is counted as-is.
+                    var count_usage = true;
+                    if (msg.object.get("id")) |idv| {
+                        if (idv == .string) {
+                            if (seen_ids.contains(idv.string)) {
+                                count_usage = false;
+                            } else {
+                                const owned = try allocator.dupe(u8, idv.string);
+                                seen_ids.put(owned, {}) catch |e| {
+                                    allocator.free(owned);
+                                    return e;
                                 };
-                            if (u.object.get("output_tokens")) |x|
-                                if (x == .integer) {
-                                    usage.output_tokens +%= @intCast(x.integer);
-                                };
-                            if (u.object.get("cache_read_input_tokens")) |x|
-                                if (x == .integer) {
-                                    usage.cache_read_input_tokens +%= @intCast(x.integer);
-                                };
-                            if (u.object.get("cache_creation_input_tokens")) |x|
-                                if (x == .integer) {
-                                    usage.cache_creation_input_tokens +%= @intCast(x.integer);
-                                };
+                            }
+                        }
+                    }
+                    if (count_usage) {
+                        if (msg.object.get("usage")) |u| {
+                            if (u == .object) {
+                                if (u.object.get("input_tokens")) |x|
+                                    if (x == .integer) {
+                                        usage.input_tokens +%= @intCast(x.integer);
+                                    };
+                                if (u.object.get("output_tokens")) |x|
+                                    if (x == .integer) {
+                                        usage.output_tokens +%= @intCast(x.integer);
+                                    };
+                                if (u.object.get("cache_read_input_tokens")) |x|
+                                    if (x == .integer) {
+                                        usage.cache_read_input_tokens +%= @intCast(x.integer);
+                                    };
+                                if (u.object.get("cache_creation_input_tokens")) |x|
+                                    if (x == .integer) {
+                                        usage.cache_creation_input_tokens +%= @intCast(x.integer);
+                                    };
+                            }
                         }
                     }
                 }
@@ -215,6 +248,17 @@ pub fn turnCountFile(allocator: std.mem.Allocator, path: ?[]const u8) u32 {
     return s.num_turns;
 }
 
+/// Deduped usage totals currently in the transcript file (each distinct assistant
+/// message id counted once), or zero if the file is absent / has no assistant
+/// message yet. The resume BILLING baseline: the live turn's usage is the
+/// post-turn deduped total minus this. Best-effort; never throws.
+pub fn usageFile(allocator: std.mem.Allocator, path: ?[]const u8) Usage {
+    const p = path orelse return .{};
+    var s = parseFile(allocator, p) catch return .{};
+    defer s.deinit(allocator);
+    return s.usage;
+}
+
 // -------- tests --------
 
 const testing = std.testing;
@@ -249,6 +293,60 @@ test "parse: multiple turns — last assistant wins" {
     // Usage accumulates across both assistant messages.
     try testing.expectEqual(@as(u64, 12), s.usage.input_tokens);
     try testing.expectEqual(@as(u64, 6), s.usage.output_tokens);
+}
+
+test "parse: dedups re-emitted assistant message id (usage counted once)" {
+    // claude-p re-emits the SAME message (same id) 2-3x (streaming snapshots);
+    // usage must count it ONCE, while num_turns keeps the raw line count.
+    const jsonl =
+        \\{"type":"assistant","session_id":"s","message":{"id":"m1","role":"assistant","content":[{"type":"text","text":"A"}],"usage":{"input_tokens":10,"output_tokens":3,"cache_read_input_tokens":100,"cache_creation_input_tokens":7}}}
+        \\{"type":"assistant","session_id":"s","message":{"id":"m1","role":"assistant","content":[{"type":"text","text":"A"}],"usage":{"input_tokens":10,"output_tokens":3,"cache_read_input_tokens":100,"cache_creation_input_tokens":7}}}
+        \\{"type":"assistant","session_id":"s","message":{"id":"m2","role":"assistant","content":[{"type":"text","text":"B"}],"usage":{"input_tokens":2,"output_tokens":5,"cache_read_input_tokens":50,"cache_creation_input_tokens":1}}}
+        \\
+    ;
+    var s = try parse(testing.allocator, jsonl);
+    defer s.deinit(testing.allocator);
+    // m1 counted ONCE (not 2x) + m2 — NOT the summed-with-dups 22/11/250/15.
+    try testing.expectEqual(@as(u64, 12), s.usage.input_tokens); // 10 + 2
+    try testing.expectEqual(@as(u64, 8), s.usage.output_tokens); // 3 + 5
+    try testing.expectEqual(@as(u64, 150), s.usage.cache_read_input_tokens); // 100 + 50
+    try testing.expectEqual(@as(u64, 8), s.usage.cache_creation_input_tokens); // 7 + 1
+    // num_turns still counts every line (raw view the staleness gate relies on).
+    try testing.expectEqual(@as(u32, 3), s.num_turns);
+}
+
+test "billing: live-turn usage = deduped(full) - deduped(baseline)" {
+    // Mirrors the resume case (.spike-notes g4): the post-turn transcript carries
+    // the replayed prior turn (id h1, re-emitted) + the live turn (id L1,
+    // re-emitted). The driver bills deduped(full) - deduped(baseline) = the live
+    // turn only, matching `claude -p`.
+    const baseline_jsonl =
+        \\{"type":"assistant","session_id":"s","message":{"id":"h1","content":[{"type":"text","text":"hist"}],"usage":{"input_tokens":1900,"output_tokens":80,"cache_read_input_tokens":300000,"cache_creation_input_tokens":10}}}
+        \\{"type":"assistant","session_id":"s","message":{"id":"h1","content":[{"type":"text","text":"hist"}],"usage":{"input_tokens":1900,"output_tokens":80,"cache_read_input_tokens":300000,"cache_creation_input_tokens":10}}}
+        \\
+    ;
+    var base = try parse(testing.allocator, baseline_jsonl);
+    defer base.deinit(testing.allocator);
+    try testing.expectEqual(@as(u64, 1900), base.usage.input_tokens); // deduped: h1 once
+    try testing.expectEqual(@as(u64, 300000), base.usage.cache_read_input_tokens);
+
+    const full_jsonl =
+        \\{"type":"assistant","session_id":"s","message":{"id":"h1","content":[{"type":"text","text":"hist"}],"usage":{"input_tokens":1900,"output_tokens":80,"cache_read_input_tokens":300000,"cache_creation_input_tokens":10}}}
+        \\{"type":"assistant","session_id":"s","message":{"id":"h1","content":[{"type":"text","text":"hist"}],"usage":{"input_tokens":1900,"output_tokens":80,"cache_read_input_tokens":300000,"cache_creation_input_tokens":10}}}
+        \\{"type":"assistant","session_id":"s","message":{"id":"L1","content":[{"type":"text","text":"live"}],"usage":{"input_tokens":2011,"output_tokens":60,"cache_read_input_tokens":320000,"cache_creation_input_tokens":5}}}
+        \\{"type":"assistant","session_id":"s","message":{"id":"L1","content":[{"type":"text","text":"live"}],"usage":{"input_tokens":2011,"output_tokens":60,"cache_read_input_tokens":320000,"cache_creation_input_tokens":5}}}
+        \\
+    ;
+    var full = try parse(testing.allocator, full_jsonl);
+    defer full.deinit(testing.allocator);
+    try testing.expectEqual(@as(u64, 1900 + 2011), full.usage.input_tokens); // deduped: h1 + L1
+    try testing.expectEqual(@as(u64, 300000 + 320000), full.usage.cache_read_input_tokens);
+
+    // full - baseline = the live turn (L1) only.
+    try testing.expectEqual(@as(u64, 2011), full.usage.input_tokens -| base.usage.input_tokens);
+    try testing.expectEqual(@as(u64, 60), full.usage.output_tokens -| base.usage.output_tokens);
+    try testing.expectEqual(@as(u64, 320000), full.usage.cache_read_input_tokens -| base.usage.cache_read_input_tokens);
+    try testing.expectEqual(@as(u64, 5), full.usage.cache_creation_input_tokens -| base.usage.cache_creation_input_tokens);
 }
 
 test "parse: result event wins for final text + flags" {

@@ -469,6 +469,11 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
     // count past this; until it does, any Stop/parse reflects a REPLAYED prior
     // turn (the `--resume` stale-result race). Captured at echo-confirm, below.
     var baseline_turns: u32 = 0;
+    // Resume BILLING baseline: the deduped usage already in the transcript before
+    // submit. The final result's usage is the post-turn deduped total MINUS this,
+    // so result.usage reflects only the live turn (mirroring `claude -p`, which
+    // bills the invocation — not the replayed history). Captured at echo-confirm.
+    var baseline_usage: transcript_mod.Usage = .{};
 
     // Live transcript tailer. Opened lazily once we learn `transcript_path`
     // (typically from the SessionStart hook payload). Only used when the
@@ -638,6 +643,7 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
                                 // turn. The live turn must push this count higher
                                 // before its result is trusted (driver post-Stop loop).
                                 baseline_turns = transcript_mod.turnCountFile(allocator, transcript_path);
+                                baseline_usage = transcript_mod.usageFile(allocator, transcript_path);
                                 traceFmt(opts, trace_start, "resume-staleness baseline = {d} assistant turn(s) before submit", .{baseline_turns});
 
                                 // The prompt is in Ink's input box but NOT yet
@@ -784,6 +790,17 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
 
     const total_ns: i128 = std.time.nanoTimestamp() - start_ns;
     const duration_ms: u64 = @intCast(@divTrunc(total_ns, std.time.ns_per_ms));
+
+    // Bill only the LIVE turn: `summary.usage` is the deduped total over the whole
+    // transcript (history + live); subtract the deduped baseline captured at submit.
+    // Saturating (`-|`) guards the degenerate case where the baseline somehow
+    // exceeds the post-turn total (e.g. a mid-turn transcript rewrite).
+    summary.usage = .{
+        .input_tokens = summary.usage.input_tokens -| baseline_usage.input_tokens,
+        .output_tokens = summary.usage.output_tokens -| baseline_usage.output_tokens,
+        .cache_read_input_tokens = summary.usage.cache_read_input_tokens -| baseline_usage.cache_read_input_tokens,
+        .cache_creation_input_tokens = summary.usage.cache_creation_input_tokens -| baseline_usage.cache_creation_input_tokens,
+    };
 
     // If we streamed transcript JSONL live, append the trailing `result`
     // envelope (the same final line `claude -p --output-format stream-json`
