@@ -41,7 +41,8 @@ pub const Options = struct {
     /// raw text. Absent → submit as soon as the prompt echoes (legacy behavior).
     mcp_ready_file: ?[]const u8 = null,
     verbose: bool = false,
-    timeout_ms: u64 = 300_000,
+    /// Wall-time cap in ms. 0 = unlimited (no cap); the cap check is skipped.
+    timeout_ms: u64 = 0,
     /// Override `claude` binary path (testing).
     claude_path: ?[]const u8 = null,
     cols: u16 = 120,
@@ -493,7 +494,7 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
     while (true) {
         const now: i128 = std.time.nanoTimestamp();
         const elapsed_ms: u64 = @intCast(@divTrunc(now - start_ns, std.time.ns_per_ms));
-        if (elapsed_ms > opts.timeout_ms) {
+        if (opts.timeout_ms != 0 and elapsed_ms > opts.timeout_ms) {
             if (state == .waiting_for_ready) return RunError.SessionStartTimeout;
             if (state == .waiting_for_mcp_ready) return RunError.McpNotReady;
             return RunError.StopTimeout;

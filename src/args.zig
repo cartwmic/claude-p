@@ -41,7 +41,9 @@ pub const Options = struct {
     session_id: ?[]const u8 = null,
     cwd: ?[]const u8 = null,
     verbose: bool = false,
-    timeout_seconds: u32 = 300,
+    /// Wall-time cap in seconds. 0 = unlimited (no cap). Default is unlimited;
+    /// an explicit --timeout or the CLAUDE_P_TIMEOUT_SECONDS env var re-imposes one.
+    timeout_seconds: u32 = 0,
     debug: bool = false,
     show_help: bool = false,
     show_version: bool = false,
@@ -133,7 +135,8 @@ const help_text =
     \\  --input-file <path>             Read prompt from a file
     \\  --mcp-ready-file <path>         Hold submit until this sentinel exists
     \\  --verbose                       Verbose output
-    \\  --timeout <seconds>             Wrapper wall-time cap (default: 300)
+    \\  --timeout <seconds>             Wall-time cap; 0 = unlimited (default: 0,
+    \\                                  overridable via CLAUDE_P_TIMEOUT_SECONDS env)
     \\  --debug                         Wrapper debug logs to stderr
     \\  --                              End of options; remaining tokens go to PROMPT
     \\  -h, --help                      Print this help
@@ -155,6 +158,7 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) ParseError!
     errdefer opts.deinit(allocator);
 
     var seen_separator = false;
+    var timeout_from_flag = false;
     var i: usize = 0;
     while (i < argv.len) : (i += 1) {
         const a = argv[i];
@@ -231,6 +235,7 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) ParseError!
             i += 1;
             if (i >= argv.len) return ParseError.MissingValue;
             opts.timeout_seconds = std.fmt.parseInt(u32, argv[i], 10) catch return ParseError.BadInteger;
+            timeout_from_flag = true;
         } else if (std.mem.eql(u8, a, "--system-prompt")) {
             i += 1;
             if (i >= argv.len) return ParseError.MissingValue;
@@ -291,6 +296,18 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) ParseError!
             // Subsequent positionals: concat lazily by appending the second
             // (we expect only one positional).
             return ParseError.UnknownFlag;
+        }
+    }
+
+    // Wall-time cap defaults to unlimited (0). When --timeout is absent, an
+    // optional CLAUDE_P_TIMEOUT_SECONDS env var can re-impose a cap. The CLI
+    // flag always wins when present; a value of 0 (flag or env) means unlimited.
+    // A non-numeric env value is ignored (stays unlimited) rather than fatal.
+    if (!timeout_from_flag) {
+        if (std.posix.getenv("CLAUDE_P_TIMEOUT_SECONDS")) |raw| {
+            if (raw.len > 0) {
+                opts.timeout_seconds = std.fmt.parseInt(u32, raw, 10) catch opts.timeout_seconds;
+            }
         }
     }
 
@@ -412,6 +429,14 @@ test "parse: --timeout" {
     var opts = try parse(testing.allocator, &.{ "--timeout", "60", "hi" });
     defer opts.deinit(testing.allocator);
     try testing.expectEqual(@as(u32, 60), opts.timeout_seconds);
+}
+
+test "parse: timeout defaults to unlimited (0) when --timeout absent" {
+    // Env may inject a cap in some environments; this asserts the no-flag,
+    // no-env default. CLAUDE_P_TIMEOUT_SECONDS is unset under the test runner.
+    var opts = try parse(testing.allocator, &.{"hi"});
+    defer opts.deinit(testing.allocator);
+    try testing.expectEqual(@as(u32, 0), opts.timeout_seconds);
 }
 
 test "parse: --resume value" {
