@@ -1,6 +1,6 @@
 ## 1. OpenSpec setup
 
-- [ ] 1.1 Commit opsx-superpowers project context and change artifacts
+- [x] 1.1 Commit opsx-superpowers project context and change artifacts
   - intent: infra
   - files_allowed:
       - openspec/**
@@ -13,7 +13,7 @@
 
 ## 2. Echo-confirm bug fix
 
-- [ ] 2.1 Add regression coverage for literal echo, captured collapsed paste, and unrelated output
+- [x] 2.1 Add regression coverage for literal echo, captured collapsed paste, and unrelated output
   - intent: fix
   - files_allowed:
       - src/driver.zig
@@ -22,7 +22,7 @@
       - "**/secrets/**"
   - allow_new_files: false
 
-- [ ] 2.2 Implement normalized paste-collapse marker detection without weakening failure detection
+- [x] 2.2 Implement normalized paste-collapse marker detection without weakening failure detection
   - intent: fix
   - files_allowed:
       - src/driver.zig
@@ -33,7 +33,7 @@
 
 ## 3. Validation and verify artifact
 
-- [ ] 3.1 Run final build and test validators and record results in verify.md
+- [x] 3.1 Run final build and test validators and record results in verify.md
   - intent: fix
   - files_allowed:
       - openspec/changes/echo-confirm-paste-collapse/tasks.md

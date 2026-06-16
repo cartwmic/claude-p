@@ -895,25 +895,29 @@ fn alnumCopy(allocator: std.mem.Allocator, src: []const u8) ![]u8 {
     return try out.toOwnedSlice(allocator);
 }
 
-/// custom: the marker Claude Code renders INSTEAD of echoing a large/multi-line
+/// custom: markers Claude Code renders INSTEAD of echoing a large/multi-line
 /// paste. Above a size/line threshold it collapses the input into placeholders
-/// like "[Pasted text #1 +30 lines][Pasted text #2 +29 lines]" and never echoes
-/// the literal text — so the needle below can never match for big prompts (e.g.
-/// the bridge's bundled system prompt). The collapse is DISPLAY-ONLY: Enter
-/// still submits the full content. So the placeholder's presence after we typed
-/// is itself proof the input was accepted, and counts as echo confirmation.
-const paste_collapse_marker = "Pasted text";
+/// like "[Pasted text #1 +30 lines]" and never echoes the literal text — so the
+/// needle below can never match for big prompts (e.g. the bridge's bundled
+/// system prompt). Ink can split the marker with cursor-position CSI escapes,
+/// producing a stripped projection like "Pastedtext#1" with no literal space.
+/// The collapse is DISPLAY-ONLY: Enter still submits the full content. So the
+/// placeholder's presence after we typed is itself proof the input was accepted,
+/// and counts as echo confirmation.
+const paste_collapse_marker_alnum = "Pastedtext";
+const paste_collapse_hint = "paste again to expand";
 
 /// custom: does the typed prompt's echo (literal, or its paste-collapse
 /// placeholder) appear in the recent PTY output? Pure, so it is unit-testable.
 ///   - `hay_alnum`: alnum-only projection of the CSI-stripped recent buffer
 ///   - `needle`:    alnum-only projection of the prompt's first echo_needle_max chars
-///   - `stripped`:  CSI-stripped recent buffer, NOT alnum-projected (keeps the
-///                  space in the `paste_collapse_marker`)
+///   - `stripped`:  CSI-stripped recent buffer, NOT alnum-projected (keeps
+///                  spaces for the paste-collapse hint phrase)
 fn echoConfirms(hay_alnum: []const u8, needle: []const u8, stripped: []const u8) bool {
     if (needle.len == 0) return true; // nothing distinctive to confirm — don't block
     if (std.mem.indexOf(u8, hay_alnum, needle) != null) return true; // literal echo (small prompts)
-    if (std.mem.indexOf(u8, stripped, paste_collapse_marker) != null) return true; // collapsed paste (large prompts)
+    if (std.mem.indexOf(u8, hay_alnum, paste_collapse_marker_alnum) != null) return true; // collapsed paste marker, whitespace/control-normalized
+    if (std.mem.indexOf(u8, stripped, paste_collapse_hint) != null) return true; // collapsed paste hint (large prompts)
     return false;
 }
 
@@ -947,18 +951,38 @@ fn promptEchoConfirmed(allocator: std.mem.Allocator, shared: *SharedState, promp
 const testing = std.testing;
 
 test "echoConfirms: literal echo matches (small prompt)" {
+    // AC: prompt-echo-confirmation.literal-prompt-echo-confirms-submission
     // Needle (alnum of prompt start) appears in the alnum-projected hay.
     try testing.expect(echoConfirms("xxHELLOWORLDxx", "HELLOWORLD", "xx HELLO WORLD xx"));
 }
 
 test "echoConfirms: paste-collapse placeholder counts as confirmation" {
+    // AC: prompt-echo-confirmation.collapsed-paste-placeholder-confirms-submission
     // Large prompt: literal needle is ABSENT (Claude Code never echoes it), but
     // the "[Pasted text #N +M lines]" placeholder is present → accepted.
     const stripped = "\xe2\x9d\xaf [Pasted text #1 +30 lines][Pasted text #2 +29 lines]";
-    try testing.expect(echoConfirms("someunrelatedchrome", "NEEDLESTARTabc", stripped));
+    const hay = try alnumCopy(testing.allocator, stripped);
+    defer testing.allocator.free(hay);
+    try testing.expect(echoConfirms(hay, "NEEDLESTARTabc", stripped));
+}
+
+test "echoConfirms: captured CSI-split paste-collapse marker confirms" {
+    // AC: prompt-echo-confirmation.collapsed-paste-placeholder-confirms-submission
+    // Captured from raw-ink-E801: Ink writes "Pasted", moves the cursor with
+    // CSI, writes "text", moves again, then writes "#1]" and the expansion hint.
+    const raw = "[Pasted\x1b[11Gtext\x1b[16G#1]\x1b[7m \r\x1b[2C\x1b[2B\x1b[27m\x1b[38;5;246mpaste again to expand\x1b[39m";
+    const stripped = try stripCsi(testing.allocator, raw);
+    defer testing.allocator.free(stripped);
+    const hay = try alnumCopy(testing.allocator, stripped);
+    defer testing.allocator.free(hay);
+
+    try testing.expectEqualStrings("[Pastedtext#1] \rpaste again to expand", stripped);
+    try testing.expect(echoConfirms(hay, "NEEDLESTARTabc", stripped));
 }
 
 test "echoConfirms: neither literal echo nor placeholder → not confirmed" {
+    // AC: prompt-echo-confirmation.unrelated-output-does-not-confirm-submission
+    // AC: prompt-echo-confirmation.prompt-not-accepted-remains-fail-fast
     try testing.expect(!echoConfirms("unrelatedoutput", "NEEDLESTART", "just some prompt text here"));
 }
 
