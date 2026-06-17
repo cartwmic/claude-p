@@ -101,6 +101,10 @@ pub const RunError = error{
     // prompt that would generate with NO bridged tools (the model would emit tool
     // calls as text). Fail fast; the caller retries on a fresh spawn.
     McpNotReady,
+    // custom: Claude Code wrote an API-error turn into the transcript and did
+    // not fire Stop. Non-retryable errors and exhausted retry budgets fail fast
+    // with the captured upstream text available via lastApiErrorMessage().
+    ApiError,
 } || std.mem.Allocator.Error;
 
 /// Build the argv for the child `claude` invocation.
@@ -241,6 +245,211 @@ const echo_needle_max: usize = 48; // alnum chars of the prompt used as the echo
 // fast (McpNotReady) rather than submit a tool-less prompt or wedge to --timeout.
 const mcp_ready_max_wait_ms: u64 = 20_000;
 
+// --- custom (API-error turn recovery) ---
+// Claude Code can flush an API-error assistant transcript record plus trailing
+// turn_duration without firing Stop. Detect that transcript-level terminal event
+// and retry only bounded, transient upstream failures.
+const api_error_retries_env = "CLAUDE_P_API_ERROR_RETRIES";
+const api_error_retries_default: u32 = 3;
+const api_error_backoff_base_ms: u64 = 250;
+const api_error_message_max: usize = 1024;
+
+var last_api_error_message: [api_error_message_max]u8 = undefined;
+var last_api_error_message_len: usize = 0;
+
+pub fn lastApiErrorMessage() []const u8 {
+    return last_api_error_message[0..last_api_error_message_len];
+}
+
+fn clearLastApiErrorMessage() void {
+    last_api_error_message_len = 0;
+}
+
+fn setLastApiErrorMessage(attempts: u32, text: []const u8) void {
+    const plural = if (attempts == 1) "" else "s";
+    const msg = std.fmt.bufPrint(
+        &last_api_error_message,
+        "claude API error after {d} attempt{s}: {s}",
+        .{ attempts, plural, text },
+    ) catch blk: {
+        const text_max = @min(text.len, api_error_message_max / 2);
+        break :blk std.fmt.bufPrint(
+            &last_api_error_message,
+            "claude API error after {d} attempt{s}: {s}...",
+            .{ attempts, plural, text[0..text_max] },
+        ) catch "claude API error";
+    };
+    last_api_error_message_len = msg.len;
+}
+
+fn apiErrorRetryLimitFromEnv() u32 {
+    const raw = std.posix.getenv(api_error_retries_env) orelse return api_error_retries_default;
+    return std.fmt.parseInt(u32, raw, 10) catch api_error_retries_default;
+}
+
+fn apiErrorBackoffMs(retries_done: u32) u64 {
+    const factor: u64 = @intCast(@min(retries_done, 4));
+    return api_error_backoff_base_ms * factor;
+}
+
+fn containsAsciiIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    if (needle.len > haystack.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        var j: usize = 0;
+        while (j < needle.len) : (j += 1) {
+            if (std.ascii.toLower(haystack[i + j]) != std.ascii.toLower(needle[j])) break;
+        }
+        if (j == needle.len) return true;
+    }
+    return false;
+}
+
+fn isRetryableApiErrorText(text: []const u8) bool {
+    const needles = [_][]const u8{
+        "overloaded",
+        "overload",
+        "capacity",
+        "http 529",
+        "529",
+        "rate limit",
+        "rate-limit",
+        "rate_limit",
+        "429",
+        "service unavailable",
+        "503",
+    };
+    for (needles) |needle| {
+        if (containsAsciiIgnoreCase(text, needle)) return true;
+    }
+    return false;
+}
+
+const ApiErrorRetryDecision = enum { retry, fail };
+
+fn apiErrorRetryDecision(retryable: bool, retries_done: u32, max_retries: u32) ApiErrorRetryDecision {
+    if (retryable and retries_done < max_retries) return .retry;
+    return .fail;
+}
+
+const ApiErrorTurn = struct {
+    text: []u8,
+    retryable: bool,
+    assistant_turns: u32,
+
+    fn deinit(self: *ApiErrorTurn, allocator: std.mem.Allocator) void {
+        allocator.free(self.text);
+    }
+};
+
+fn jsonBool(obj: std.json.ObjectMap, key: []const u8) bool {
+    const v = obj.get(key) orelse return false;
+    return v == .bool and v.bool;
+}
+
+fn jsonStringEquals(obj: std.json.ObjectMap, key: []const u8, expected: []const u8) bool {
+    const v = obj.get(key) orelse return false;
+    return v == .string and std.mem.eql(u8, v.string, expected);
+}
+
+fn appendContentText(allocator: std.mem.Allocator, out: *std.ArrayList(u8), content: std.json.Value) !void {
+    if (content != .array) return;
+    for (content.array.items) |block| {
+        if (block != .object) continue;
+        const block_type = block.object.get("type") orelse continue;
+        if (block_type != .string or !std.mem.eql(u8, block_type.string, "text")) continue;
+        if (block.object.get("text")) |t| {
+            if (t == .string) try out.appendSlice(allocator, t.string);
+        }
+    }
+}
+
+fn extractAssistantText(allocator: std.mem.Allocator, obj: std.json.ObjectMap) ![]u8 {
+    var text: std.ArrayList(u8) = .{};
+    errdefer text.deinit(allocator);
+
+    if (obj.get("content")) |content| try appendContentText(allocator, &text, content);
+    if (obj.get("message")) |msg| {
+        if (msg == .object) {
+            if (msg.object.get("content")) |content| try appendContentText(allocator, &text, content);
+        }
+    }
+
+    return try text.toOwnedSlice(allocator);
+}
+
+fn isApiErrorAssistant(obj: std.json.ObjectMap) bool {
+    if (jsonBool(obj, "isApiErrorMessage")) return true;
+    if (obj.get("message")) |msg| {
+        if (msg == .object and jsonBool(msg.object, "isApiErrorMessage")) return true;
+    }
+    return false;
+}
+
+fn detectApiErrorTurnEnd(allocator: std.mem.Allocator, bytes: []const u8, baseline_turns: u32) !?ApiErrorTurn {
+    var assistant_turns: u32 = 0;
+    var pending_text: ?[]u8 = null;
+    errdefer if (pending_text) |p| allocator.free(p);
+
+    var line_iter = std.mem.splitScalar(u8, bytes, '\n');
+    while (line_iter.next()) |raw_line| {
+        var line = raw_line;
+        if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
+        if (line.len == 0) continue;
+
+        var parsed = std.json.parseFromSlice(
+            std.json.Value,
+            allocator,
+            line,
+            .{ .ignore_unknown_fields = true },
+        ) catch continue;
+        defer parsed.deinit();
+
+        const root = parsed.value;
+        if (root != .object) continue;
+        const obj = root.object;
+        const ty = obj.get("type") orelse continue;
+        if (ty != .string) continue;
+
+        if (std.mem.eql(u8, ty.string, "assistant")) {
+            assistant_turns += 1;
+            if (pending_text) |p| allocator.free(p);
+            pending_text = null;
+            if (assistant_turns > baseline_turns and isApiErrorAssistant(obj)) {
+                pending_text = try extractAssistantText(allocator, obj);
+            }
+        } else if (std.mem.eql(u8, ty.string, "system")) {
+            if (jsonStringEquals(obj, "subtype", "turn_duration")) {
+                if (pending_text) |p| {
+                    pending_text = null;
+                    return ApiErrorTurn{
+                        .text = p,
+                        .retryable = isRetryableApiErrorText(p),
+                        .assistant_turns = assistant_turns,
+                    };
+                }
+            }
+        }
+    }
+
+    return null;
+}
+
+fn detectApiErrorTurnEndFile(allocator: std.mem.Allocator, path: []const u8, baseline_turns: u32) !?ApiErrorTurn {
+    const file = try std.fs.cwd().openFile(path, .{});
+    defer file.close();
+    const bytes = try file.readToEndAlloc(allocator, 64 * 1024 * 1024);
+    defer allocator.free(bytes);
+    return detectApiErrorTurnEnd(allocator, bytes, baseline_turns);
+}
+
+fn clearRecent(shared: *SharedState) void {
+    shared.recent_mutex.lock();
+    shared.recent.clearRetainingCapacity();
+    shared.recent_mutex.unlock();
+}
+
 /// True if an absolute path exists and is accessible. Used to poll for the
 /// MCP-readiness sentinel without blocking the main loop.
 fn fileExists(path: []const u8) bool {
@@ -362,6 +571,7 @@ fn onZmuxEvent(ctx: *anyopaque, event: zmux.native.Event) void {
 
 pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
     if (opts.prompt.len == 0) return RunError.NoPromptSupplied;
+    clearLastApiErrorMessage();
 
     const trace_start: i128 = std.time.nanoTimestamp();
     trace(opts, trace_start, "run() entered");
@@ -491,6 +701,9 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
     defer if (tailer) |*t| t.deinit();
     var tailer_open_attempts: u32 = 0;
 
+    const api_error_retry_limit = apiErrorRetryLimitFromEnv();
+    var api_error_retries_done: u32 = 0;
+
     while (true) {
         const now: i128 = std.time.nanoTimestamp();
         const elapsed_ms: u64 = @intCast(@divTrunc(now - start_ns, std.time.ns_per_ms));
@@ -577,7 +790,7 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
                             // path. Stash it so the main loop can keep
                             // trying to open the tailer until the file
                             // actually exists on disk.
-                            if (streaming and transcript_path == null) {
+                            if (transcript_path == null) {
                                 if (try hook_mod.extractTranscriptPath(allocator, ev.payload)) |p| {
                                     transcript_path = p;
                                     traceFmt(opts, trace_start, "transcript_path from SessionStart: {s}", .{p});
@@ -723,6 +936,77 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
                     first_emit_logged = true;
                 } else {
                     traceFmt(opts, trace_start, "streamed {d} more line(s) (total={d})", .{ n, total_lines_streamed });
+                }
+            }
+        }
+
+        // API-error turn-end detection: Claude Code can finish a turn by
+        // flushing an isApiErrorMessage assistant record plus turn_duration
+        // without firing Stop. Poll the transcript once known, even when the
+        // caller did not request stream-json tailing.
+        if (state == .awaiting_stop and stop_payload_owned == null) {
+            if (transcript_path) |p| {
+                var api_turn = detectApiErrorTurnEndFile(allocator, p, baseline_turns) catch |e| switch (e) {
+                    error.FileNotFound => null,
+                    else => return e,
+                };
+                if (api_turn) |*turn| {
+                    defer turn.deinit(allocator);
+                    const failed_attempts = api_error_retries_done + 1;
+                    if (apiErrorRetryDecision(turn.retryable, api_error_retries_done, api_error_retry_limit) == .retry) {
+                        api_error_retries_done += 1;
+                        const backoff_ms = apiErrorBackoffMs(api_error_retries_done);
+                        traceFmt(
+                            opts,
+                            trace_start,
+                            "API-error turn confirmed after {d} attempt(s): {s}; retry {d}/{d} after {d}ms",
+                            .{ failed_attempts, turn.text, api_error_retries_done, api_error_retry_limit, backoff_ms },
+                        );
+                        std.Thread.sleep(backoff_ms * std.time.ns_per_ms);
+
+                        baseline_turns = transcript_mod.turnCountFile(allocator, transcript_path);
+                        baseline_usage = transcript_mod.usageFile(allocator, transcript_path);
+                        traceFmt(opts, trace_start, "resume-staleness baseline reset after API error = {d} assistant turn(s)", .{baseline_turns});
+
+                        clearRecent(&shared);
+                        var attempt: usize = 0;
+                        var confirmed = false;
+                        while (attempt < echo_confirm_max_attempts and !confirmed) : (attempt += 1) {
+                            if (attempt > 0) {
+                                session.send("\x15", false) catch {};
+                                std.Thread.sleep(40 * std.time.ns_per_ms);
+                                clearRecent(&shared);
+                            }
+                            traceFmt(opts, trace_start, "retyping prompt after API error ({d} bytes), attempt {d}", .{ opts.prompt.len, attempt + 1 });
+                            session.send(opts.prompt, false) catch {};
+
+                            const echo_window_ns: i64 = @intCast(echo_confirm_window_ms * std.time.ns_per_ms);
+                            const echo_wait_start: i64 = @intCast(std.time.nanoTimestamp());
+                            while (true) {
+                                if (promptEchoConfirmed(allocator, &shared, opts.prompt) catch false) {
+                                    confirmed = true;
+                                    break;
+                                }
+                                const echo_now: i64 = @intCast(std.time.nanoTimestamp());
+                                if (echo_now - echo_wait_start > echo_window_ns) break;
+                                std.Thread.sleep(25 * std.time.ns_per_ms);
+                            }
+                        }
+
+                        if (!confirmed) {
+                            traceFmt(opts, trace_start, "retry prompt echo never confirmed after {d} attempt(s) — failing fast (PromptNotAccepted)", .{echo_confirm_max_attempts});
+                            return RunError.PromptNotAccepted;
+                        }
+
+                        std.Thread.sleep(ink_enter_debounce_ms * std.time.ns_per_ms);
+                        session.send("", true) catch {};
+                        trace(opts, trace_start, "retry prompt echo confirmed; Enter sent; waiting on claude API");
+                    } else {
+                        setLastApiErrorMessage(failed_attempts, turn.text);
+                        traceFmt(opts, trace_start, "API-error turn failed fast: {s}", .{lastApiErrorMessage()});
+                        session.terminate();
+                        return RunError.ApiError;
+                    }
                 }
             }
         }
@@ -949,6 +1233,54 @@ fn promptEchoConfirmed(allocator: std.mem.Allocator, shared: *SharedState, promp
 // -------- tests --------
 
 const testing = std.testing;
+
+test "api error detector: overloaded turn after baseline is terminal and retryable" {
+    // AC: api-error-turns.transcript-api-error-ends-turn
+    // AC: api-error-turns.retryable-api-errors-are-resubmitted-boundedly
+    const jsonl =
+        \\{"type":"assistant","session_id":"s","message":{"content":[{"type":"text","text":"prior"}]}}
+        \\{"type":"user","session_id":"s","message":{"content":[{"type":"text","text":"live"}]}}
+        \\{"type":"assistant","session_id":"s","isApiErrorMessage":true,"message":{"content":[{"type":"text","text":"API Error: Overloaded"}]}}
+        \\{"type":"system","subtype":"turn_duration","session_id":"s","durationMs":123,"messageCount":2}
+        \\
+    ;
+    var turn = (try detectApiErrorTurnEnd(testing.allocator, jsonl, 1)).?;
+    defer turn.deinit(testing.allocator);
+    try testing.expectEqualStrings("API Error: Overloaded", turn.text);
+    try testing.expect(turn.retryable);
+    try testing.expectEqual(@as(u32, 2), turn.assistant_turns);
+}
+
+test "api error classifier: non-retryable auth error fails" {
+    // AC: api-error-turns.non-retryable-api-errors-fail-fast
+    const jsonl =
+        \\{"type":"assistant","session_id":"s","isApiErrorMessage":true,"message":{"content":[{"type":"text","text":"API Error: invalid x-api-key"}]}}
+        \\{"type":"system","subtype":"turn_duration","session_id":"s","durationMs":123,"messageCount":1}
+        \\
+    ;
+    var turn = (try detectApiErrorTurnEnd(testing.allocator, jsonl, 0)).?;
+    defer turn.deinit(testing.allocator);
+    try testing.expectEqualStrings("API Error: invalid x-api-key", turn.text);
+    try testing.expect(!turn.retryable);
+    try testing.expectEqual(ApiErrorRetryDecision.fail, apiErrorRetryDecision(turn.retryable, 0, api_error_retries_default));
+}
+
+test "api error detector: normal assistant turn is not api error" {
+    // AC: api-error-turns.normal-assistant-turns-are-not-api-errors
+    const jsonl =
+        \\{"type":"assistant","session_id":"s","message":{"content":[{"type":"text","text":"normal answer"}]}}
+        \\{"type":"system","subtype":"turn_duration","session_id":"s","durationMs":123,"messageCount":1}
+        \\
+    ;
+    try testing.expect((try detectApiErrorTurnEnd(testing.allocator, jsonl, 0)) == null);
+}
+
+test "api error retry boundary: exhausted retry budget fails" {
+    // AC: api-error-turns.exhausted-api-error-retries-fail-fast
+    try testing.expectEqual(ApiErrorRetryDecision.retry, apiErrorRetryDecision(true, 2, 3));
+    try testing.expectEqual(ApiErrorRetryDecision.fail, apiErrorRetryDecision(true, 3, 3));
+    try testing.expectEqual(ApiErrorRetryDecision.fail, apiErrorRetryDecision(false, 0, 3));
+}
 
 test "echoConfirms: literal echo matches (small prompt)" {
     // AC: prompt-echo-confirmation.literal-prompt-echo-confirms-submission

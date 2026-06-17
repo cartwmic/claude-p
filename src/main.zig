@@ -87,7 +87,16 @@ pub fn main() !void {
         .debug = opts.debug,
         .stream_writer = stream_writer,
     }) catch |err| {
-        try stderrWriter().print("claude-p: {s}\n", .{@errorName(err)});
+        if (err == error.ApiError) {
+            const msg = claude_p.driver.lastApiErrorMessage();
+            if (msg.len > 0) {
+                try stderrWriter().print("claude-p: {s}\n", .{msg});
+            } else {
+                try stderrWriter().writeAll("claude-p: ApiError\n");
+            }
+        } else {
+            try stderrWriter().print("claude-p: {s}\n", .{@errorName(err)});
+        }
         try stderrWriter().flush();
         std.process.exit(2);
     };
