@@ -82,6 +82,7 @@ pub fn main() !void {
         .add_dirs = opts.add_dirs.items,
         .mcp_configs = opts.mcp_configs.items,
         .mcp_ready_file = opts.mcp_ready_file,
+        .mirror_file = opts.mirror_file,
         .verbose = opts.verbose,
         .timeout_ms = @as(u64, opts.timeout_seconds) * 1000,
         .debug = opts.debug,

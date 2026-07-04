@@ -55,6 +55,7 @@ npx claude-p --model opus "explain quicksort to a 10-year-old"
 --append-system-prompt <text>
 --add-dir <dir>...                        repeatable, variadic
 --mcp-config <cfg>...                     repeatable, variadic
+--mirror-file <path>                      tee raw PTY output bytes to this file (write-only observer)
 --setting-sources <user,project,local>
 --resume <id> | --continue | --session-id <uuid>
 --cwd <path>

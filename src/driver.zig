@@ -43,6 +43,15 @@ pub const Options = struct {
     verbose: bool = false,
     /// Wall-time cap in ms. 0 = unlimited (no cap); the cap check is skipped.
     timeout_ms: u64 = 0,
+    /// Optional write-only mirror of raw PTY output bytes. When set, every
+    /// byte read from the `claude` PTY output is appended to this file in
+    /// arrival order (pure tee). Strictly observational: nothing is ever
+    /// written back to the PTY on behalf of the mirror, and prompt-delivery
+    /// behavior is identical whether the flag is present or absent. Open
+    /// and write failures are non-fatal: mirroring is disabled for the rest
+    /// of the turn with a single stderr note; exit code and stdout output
+    /// are unaffected. (claude-p-fork.write-only-pty-output-mirror)
+    mirror_file: ?[]const u8 = null,
     /// Override `claude` binary path (testing).
     claude_path: ?[]const u8 = null,
     cols: u16 = 120,
@@ -526,7 +535,35 @@ const SharedState = struct {
     recent_mutex: std.Thread.Mutex = .{},
     recent: std.ArrayList(u8) = .{},
     trust_dismissed: bool = false,
+    // Write-only PTY output mirror (claude-p-fork.write-only-pty-output-mirror).
+    // Touched only by the reader thread (pane_output events are serialized),
+    // so no mutex is needed. `mirror_failed` latches on first error; a single
+    // stderr note is emitted at latch time and the turn proceeds unaffected.
+    mirror_path: ?[]const u8 = null,
+    mirror_file: ?std.fs.File = null,
+    mirror_failed: bool = false,
 };
+
+/// Append one PTY output chunk to the mirror file (pure tee; arrival order).
+/// Lazy-opens on the first chunk. All failures are non-fatal: latch
+/// `mirror_failed`, note once on stderr, never affect the turn.
+fn mirrorChunk(shared: *SharedState, data: []const u8) void {
+    if (shared.mirror_failed) return;
+    const path = shared.mirror_path orelse return;
+    if (shared.mirror_file == null) {
+        shared.mirror_file = std.fs.cwd().createFile(path, .{ .truncate = true }) catch {
+            shared.mirror_failed = true;
+            std.debug.print("claude-p: --mirror-file open failed ({s}); mirroring disabled for this turn\n", .{path});
+            return;
+        };
+    }
+    shared.mirror_file.?.writeAll(data) catch {
+        shared.mirror_failed = true;
+        if (shared.mirror_file) |f| f.close();
+        shared.mirror_file = null;
+        std.debug.print("claude-p: --mirror-file write failed; mirroring disabled for this turn\n", .{});
+    };
+}
 
 const recent_capacity: usize = 8192;
 
@@ -535,6 +572,7 @@ fn onZmuxEvent(ctx: *anyopaque, event: zmux.native.Event) void {
     switch (event) {
         .pane_output => |po| {
             _ = shared.bytes_seen.fetchAdd(po.data.len, .seq_cst);
+            mirrorChunk(shared, po.data);
             shared.last_output_ns.store(@intCast(std.time.nanoTimestamp()), .seq_cst);
             // Run the DEC-query responder; queue responses for the main loop.
             var resp: std.ArrayList(u8) = .{};
@@ -627,6 +665,7 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
     var shared: SharedState = .{
         .session = undefined, // set after create
         .debug = opts.debug,
+        .mirror_path = opts.mirror_file,
     };
     defer {
         shared.write_mutex.lock();
@@ -635,6 +674,7 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
         shared.recent_mutex.lock();
         shared.recent.deinit(std.heap.page_allocator);
         shared.recent_mutex.unlock();
+        if (shared.mirror_file) |f| f.close();
     }
 
     const sink: zmux.native.EventSink = .{
@@ -1448,4 +1488,42 @@ test "shellQuoteArgv: json with double quotes survives" {
 
 test "run: empty prompt rejected" {
     try testing.expectError(RunError.NoPromptSupplied, run(testing.allocator, .{ .prompt = "" }));
+}
+
+test "mirrorChunk: pure tee in arrival order (claude-p-fork.write-only-pty-output-mirror)" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(path);
+    const mirror_path = try std.fs.path.join(std.testing.allocator, &.{ path, "m.raw" });
+    defer std.testing.allocator.free(mirror_path);
+
+    var shared: SharedState = .{ .session = undefined, .debug = false, .mirror_path = mirror_path };
+    mirrorChunk(&shared, "\x1b[2Jhello ");
+    mirrorChunk(&shared, "world");
+    if (shared.mirror_file) |f| f.close();
+
+    const got = try std.fs.cwd().readFileAlloc(std.testing.allocator, mirror_path, 1 << 20);
+    defer std.testing.allocator.free(got);
+    try std.testing.expectEqualStrings("\x1b[2Jhello world", got);
+}
+
+test "mirrorChunk: absent path writes nothing" {
+    var shared: SharedState = .{ .session = undefined, .debug = false };
+    mirrorChunk(&shared, "data");
+    try std.testing.expectEqual(@as(?std.fs.File, null), shared.mirror_file);
+    try std.testing.expect(!shared.mirror_failed);
+}
+
+test "mirrorChunk: unwritable path latches non-fatally" {
+    var shared: SharedState = .{
+        .session = undefined,
+        .debug = false,
+        .mirror_path = "/nonexistent-dir-claude-p-test/m.raw",
+    };
+    mirrorChunk(&shared, "data");
+    try std.testing.expect(shared.mirror_failed);
+    // Subsequent chunks are no-ops, never errors.
+    mirrorChunk(&shared, "more");
+    try std.testing.expect(shared.mirror_failed);
 }

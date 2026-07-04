@@ -65,6 +65,10 @@ pub const Options = struct {
     /// once it has served tools/list). Consumed here so it is NOT forwarded to
     /// `claude`, which does not understand it. See driver.Options.mcp_ready_file.
     mcp_ready_file: ?[]const u8 = null,
+    /// Optional write-only mirror of raw PTY output bytes (pure tee).
+    /// Consumed here so it is NOT forwarded to `claude`. See
+    /// driver.Options.mirror_file.
+    mirror_file: ?[]const u8 = null,
 
     /// Arguments we don't recognize: passed through verbatim to `claude`.
     passthrough: std.ArrayList([]const u8) = .{},
@@ -134,6 +138,7 @@ const help_text =
     \\  --cwd <path>                    Working directory for `claude`
     \\  --input-file <path>             Read prompt from a file
     \\  --mcp-ready-file <path>         Hold submit until this sentinel exists
+    \\  --mirror-file <path>            Tee raw PTY output bytes to this file (write-only observer)
     \\  --verbose                       Verbose output
     \\  --timeout <seconds>             Wall-time cap; 0 = unlimited (default: 0,
     \\                                  overridable via CLAUDE_P_TIMEOUT_SECONDS env)
@@ -227,6 +232,10 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) ParseError!
             i += 1;
             if (i >= argv.len) return ParseError.MissingValue;
             opts.mcp_ready_file = argv[i];
+        } else if (std.mem.eql(u8, a, "--mirror-file")) {
+            i += 1;
+            if (i >= argv.len) return ParseError.MissingValue;
+            opts.mirror_file = argv[i];
         } else if (std.mem.eql(u8, a, "--verbose")) {
             opts.verbose = true;
         } else if (std.mem.eql(u8, a, "--debug")) {
@@ -449,6 +458,25 @@ test "parse: --input-file" {
     var opts = try parse(testing.allocator, &.{ "--input-file", "/tmp/p.md" });
     defer opts.deinit(testing.allocator);
     try testing.expectEqualStrings("/tmp/p.md", opts.input_file.?);
+}
+
+test "parse: --mirror-file is consumed (not forwarded to claude)" {
+    // claude-p-fork.write-only-pty-output-mirror
+    var opts = try parse(testing.allocator, &.{ "--mirror-file", "/tmp/x.raw", "hi" });
+    defer opts.deinit(testing.allocator);
+    try testing.expectEqualStrings("/tmp/x.raw", opts.mirror_file.?);
+    try testing.expectEqualStrings("hi", opts.prompt.?);
+    try testing.expectEqual(@as(usize, 0), opts.passthrough.items.len);
+}
+
+test "parse: --mirror-file missing value fails" {
+    try testing.expectError(ParseError.MissingValue, parse(testing.allocator, &.{"--mirror-file"}));
+}
+
+test "parse: mirror_file defaults to null" {
+    var opts = try parse(testing.allocator, &.{"hi"});
+    defer opts.deinit(testing.allocator);
+    try testing.expectEqual(@as(?[]const u8, null), opts.mirror_file);
 }
 
 test "parse: --mcp-ready-file is consumed (not forwarded to claude)" {
