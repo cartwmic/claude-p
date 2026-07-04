@@ -234,7 +234,9 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) ParseError!
             opts.mcp_ready_file = argv[i];
         } else if (std.mem.eql(u8, a, "--mirror-file")) {
             i += 1;
-            if (i >= argv.len) return ParseError.MissingValue;
+            // Empty path is as unusable as a missing one — reject rather than
+            // carrying a value that can only fail at open time.
+            if (i >= argv.len or argv[i].len == 0) return ParseError.MissingValue;
             opts.mirror_file = argv[i];
         } else if (std.mem.eql(u8, a, "--verbose")) {
             opts.verbose = true;
@@ -471,6 +473,10 @@ test "parse: --mirror-file is consumed (not forwarded to claude)" {
 
 test "parse: --mirror-file missing value fails" {
     try testing.expectError(ParseError.MissingValue, parse(testing.allocator, &.{"--mirror-file"}));
+}
+
+test "parse: --mirror-file empty value fails" {
+    try testing.expectError(ParseError.MissingValue, parse(testing.allocator, &.{ "--mirror-file", "", "hi" }));
 }
 
 test "parse: mirror_file defaults to null" {
