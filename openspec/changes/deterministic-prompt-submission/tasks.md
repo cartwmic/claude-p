@@ -1,6 +1,6 @@
 ## 1. Spec and governance alignment
 
-- [ ] 1.1 Restate `openspec/constitution.md` for two-phase prompt acceptance and no liveness timeouts.
+- [x] 1.1 Restate `openspec/constitution.md` for two-phase prompt acceptance and no liveness timeouts.
   - intent: feature
   - files_allowed:
       - openspec/constitution.md
