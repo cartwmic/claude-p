@@ -33,7 +33,7 @@
   - files_allowed:
       - src/driver.zig
   - allow_new_files: false
-- [ ] 2.4 Retire PTY echo / paste-pill acceptance as the authoritative submission gate once transcript-record acceptance satisfies the Reliability bar.
+- [x] 2.4 Retire PTY echo / paste-pill acceptance as the authoritative submission gate once transcript-record acceptance satisfies the Reliability bar.
   - intent: fix
   - files_allowed:
       - src/driver.zig

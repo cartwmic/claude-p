@@ -490,6 +490,24 @@ fn transcriptHasNewUserRecord(allocator: std.mem.Allocator, path: ?[]const u8, b
     return userRecordCountFile(allocator, path) > baseline_user_records;
 }
 
+fn waitForTranscriptUserRecord(
+    allocator: std.mem.Allocator,
+    opts: Options,
+    trace_start: i128,
+    shared: *SharedState,
+    path: ?[]const u8,
+    baseline_user_records: u32,
+) RunError!void {
+    while (true) {
+        if (transcriptHasNewUserRecord(allocator, path, baseline_user_records)) {
+            trace(opts, trace_start, "transcript user-record acceptance confirmed");
+            return;
+        }
+        if (shared.exited.load(.seq_cst)) return RunError.PromptNotAccepted;
+        std.Thread.sleep(15 * std.time.ns_per_ms);
+    }
+}
+
 fn clearRecent(shared: *SharedState) void {
     shared.recent_mutex.lock();
     shared.recent.clearRetainingCapacity();
@@ -752,7 +770,6 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
     //   readiness sentinel (only entered when opts.mcp_ready_file is set)
     // awaiting_stop      → Enter sent, waiting on the Stop hook
     var state: enum { waiting_for_ready, waiting_for_mcp_ready, awaiting_stop } = .waiting_for_ready;
-    var mcp_ready_deadline_ns: i128 = 0;
     var first_emit_logged = false;
     var total_lines_streamed: usize = 0;
 
@@ -812,19 +829,18 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
             return RunError.SpawnFailed;
         }
 
-        // MCP-readiness gate: the prompt is typed and echoed; we hold the submit
-        // Enter here (the main loop keeps servicing the PTY) until the shim's
-        // sentinel appears, then submit. Fail fast if it never shows.
+        // MCP-readiness gate: the prompt paste has completed; we hold submit
+        // Enter until the shim's sentinel appears. This is an event wait (like
+        // the readiness and transcript gates), not a liveness timeout.
         if (state == .waiting_for_mcp_ready) {
             if (opts.mcp_ready_file) |rf| {
                 if (fileExists(rf)) {
                     std.Thread.sleep(ink_enter_debounce_ms * std.time.ns_per_ms);
                     session.send("", true) catch {};
-                    trace(opts, trace_start, "MCP surface ready; Enter sent; waiting on claude API");
+                    trace(opts, trace_start, "MCP surface ready; Enter sent; waiting for transcript user-record acceptance");
+                    try waitForTranscriptUserRecord(allocator, opts, trace_start, &shared, transcript_path, baseline_user_records);
+                    trace(opts, trace_start, "transcript accepted prompt; waiting on claude API");
                     state = .awaiting_stop;
-                } else if (now > mcp_ready_deadline_ns) {
-                    traceFmt(opts, trace_start, "MCP readiness sentinel never appeared within {d}ms — failing fast (McpNotReady)", .{mcp_ready_max_wait_ms});
-                    return RunError.McpNotReady;
                 }
             }
         }
@@ -898,74 +914,27 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
                                 // dropped by the not-yet-ready TUI.
                                 try waitForInputReadiness(opts, trace_start, &shared);
 
-                                // custom (echo-confirmed input): type the
-                                // prompt, then CONFIRM it echoed into Ink's
-                                // input box before committing Enter. Prompt and
-                                // `\r` are still sent as two events (Ink's
-                                // bracketed-paste heuristic merges back-to-back
-                                // writes, so a same-burst `\r` would land in the
-                                // buffer instead of submitting). Under
-                                // concurrent-boot contention the keystrokes can
-                                // be dropped by a not-yet-ready TUI; retype
-                                // (clear-line first, so a partial can't
-                                // concatenate) up to echo_confirm_max_attempts,
-                                // then fail fast rather than wedge until
-                                // --timeout for a Stop that can never come.
-                                var attempt: usize = 0;
-                                var confirmed = false;
-                                while (attempt < echo_confirm_max_attempts and !confirmed) : (attempt += 1) {
-                                    if (attempt > 0) {
-                                        // Ctrl-U kills the input line so a
-                                        // partially-accepted prior attempt
-                                        // cannot concatenate into a corrupt prompt.
-                                        session.send("\x15", false) catch {};
-                                        std.Thread.sleep(40 * std.time.ns_per_ms);
-                                    }
-                                    traceFmt(opts, trace_start, "pasting prompt ({d} bytes), attempt {d}", .{ opts.prompt.len, attempt + 1 });
-                                    writeBracketedPaste(session, opts.prompt) catch {};
+                                traceFmt(opts, trace_start, "pasting prompt ({d} bytes)", .{opts.prompt.len});
+                                writeBracketedPaste(session, opts.prompt) catch {};
 
-                                    const echo_window_ns: i64 = @intCast(echo_confirm_window_ms * std.time.ns_per_ms);
-                                    const echo_wait_start: i64 = @intCast(std.time.nanoTimestamp());
-                                    while (true) {
-                                        if (promptEchoConfirmed(allocator, &shared, opts.prompt) catch false) {
-                                            confirmed = true;
-                                            break;
-                                        }
-                                        const echo_now: i64 = @intCast(std.time.nanoTimestamp());
-                                        if (echo_now - echo_wait_start > echo_window_ns) break;
-                                        std.Thread.sleep(25 * std.time.ns_per_ms);
-                                    }
-                                }
-
-                                if (!confirmed) {
-                                    traceFmt(opts, trace_start, "prompt echo never confirmed after {d} attempt(s) — failing fast (PromptNotAccepted)", .{echo_confirm_max_attempts});
-                                    return RunError.PromptNotAccepted;
-                                }
-
-                                // Resume-staleness guard: snapshot how many assistant
-                                // turns the transcript already has BEFORE submit. The
-                                // prompt is echoed into Ink's input box but NOT yet
-                                // committed, so the transcript still ends at the prior
-                                // turn. The live turn must push this count higher
-                                // before its result is trusted (driver post-Stop loop).
+                                // Snapshot baselines after paste delivery but before
+                                // submit Enter. The transcript still ends at the prior
+                                // turn; the live prompt must create a new user record
+                                // before any assistant Stop/result is trusted.
                                 baseline_turns = transcript_mod.turnCountFile(allocator, transcript_path);
                                 baseline_user_records = userRecordCountFile(allocator, transcript_path);
                                 baseline_usage = transcript_mod.usageFile(allocator, transcript_path);
                                 traceFmt(opts, trace_start, "submit baselines before Enter: assistant_turns={d}, user_records={d}", .{ baseline_turns, baseline_user_records });
 
-                                // The prompt is in Ink's input box but NOT yet
-                                // submitted. When an MCP-readiness sentinel was
-                                // requested, hold the Enter until the bridged tool
-                                // surface is live (the main loop polls the file and
-                                // submits); otherwise submit immediately (legacy).
                                 if (opts.mcp_ready_file) |rf| {
-                                    mcp_ready_deadline_ns = std.time.nanoTimestamp() + @as(i128, @intCast(mcp_ready_max_wait_ms)) * std.time.ns_per_ms;
-                                    traceFmt(opts, trace_start, "prompt echo confirmed; holding Enter for MCP readiness (file={s})", .{rf});
+                                    traceFmt(opts, trace_start, "prompt pasted; holding Enter for MCP readiness (file={s})", .{rf});
                                     state = .waiting_for_mcp_ready;
                                 } else {
                                     std.Thread.sleep(ink_enter_debounce_ms * std.time.ns_per_ms);
                                     session.send("", true) catch {};
-                                    trace(opts, trace_start, "prompt echo confirmed; Enter sent; waiting on claude API");
+                                    trace(opts, trace_start, "Enter sent; waiting for transcript user-record acceptance");
+                                    try waitForTranscriptUserRecord(allocator, opts, trace_start, &shared, transcript_path, baseline_user_records);
+                                    trace(opts, trace_start, "transcript accepted prompt; waiting on claude API");
                                     state = .awaiting_stop;
                                 }
                             }
@@ -1062,39 +1031,14 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
                         baseline_usage = transcript_mod.usageFile(allocator, transcript_path);
                         traceFmt(opts, trace_start, "submit baselines reset after API error: assistant_turns={d}, user_records={d}", .{ baseline_turns, baseline_user_records });
 
-                        clearRecent(&shared);
-                        var attempt: usize = 0;
-                        var confirmed = false;
-                        while (attempt < echo_confirm_max_attempts and !confirmed) : (attempt += 1) {
-                            if (attempt > 0) {
-                                session.send("\x15", false) catch {};
-                                std.Thread.sleep(40 * std.time.ns_per_ms);
-                                clearRecent(&shared);
-                            }
-                            traceFmt(opts, trace_start, "repasting prompt after API error ({d} bytes), attempt {d}", .{ opts.prompt.len, attempt + 1 });
-                            writeBracketedPaste(session, opts.prompt) catch {};
-
-                            const echo_window_ns: i64 = @intCast(echo_confirm_window_ms * std.time.ns_per_ms);
-                            const echo_wait_start: i64 = @intCast(std.time.nanoTimestamp());
-                            while (true) {
-                                if (promptEchoConfirmed(allocator, &shared, opts.prompt) catch false) {
-                                    confirmed = true;
-                                    break;
-                                }
-                                const echo_now: i64 = @intCast(std.time.nanoTimestamp());
-                                if (echo_now - echo_wait_start > echo_window_ns) break;
-                                std.Thread.sleep(25 * std.time.ns_per_ms);
-                            }
-                        }
-
-                        if (!confirmed) {
-                            traceFmt(opts, trace_start, "retry prompt echo never confirmed after {d} attempt(s) — failing fast (PromptNotAccepted)", .{echo_confirm_max_attempts});
-                            return RunError.PromptNotAccepted;
-                        }
+                        traceFmt(opts, trace_start, "repasting prompt after API error ({d} bytes)", .{opts.prompt.len});
+                        writeBracketedPaste(session, opts.prompt) catch {};
 
                         std.Thread.sleep(ink_enter_debounce_ms * std.time.ns_per_ms);
                         session.send("", true) catch {};
-                        trace(opts, trace_start, "retry prompt echo confirmed; Enter sent; waiting on claude API");
+                        trace(opts, trace_start, "retry Enter sent; waiting for transcript user-record acceptance");
+                        try waitForTranscriptUserRecord(allocator, opts, trace_start, &shared, transcript_path, baseline_user_records);
+                        trace(opts, trace_start, "transcript accepted retry prompt; waiting on claude API");
                     } else {
                         setLastApiErrorMessage(failed_attempts, turn.text);
                         traceFmt(opts, trace_start, "API-error turn failed fast: {s}", .{lastApiErrorMessage()});
