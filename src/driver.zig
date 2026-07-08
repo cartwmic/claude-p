@@ -101,14 +101,13 @@ pub const RunError = error{
     TranscriptUnavailable,
     SpawnFailed,
     NoPromptSupplied,
-    // custom: the typed prompt never echoed back into Ink's input box within
-    // the bounded retype budget (input dropped by a not-yet-ready TUI). Fail
-    // fast instead of waiting --timeout for a Stop hook that can never fire.
+    // custom: positive terminal/non-acceptance evidence proved the current
+    // prompt was not accepted into the transcript. Missing echo evidence and
+    // elapsed time alone do not produce this error.
     PromptNotAccepted,
-    // custom: the MCP-readiness sentinel (Options.mcp_ready_file) never appeared
-    // within mcp_ready_max_wait_ms after the prompt echoed. We refuse to submit a
-    // prompt that would generate with NO bridged tools (the model would emit tool
-    // calls as text). Fail fast; the caller retries on a fresh spawn.
+    // custom: opt-in --timeout/CLAUDE_P_TIMEOUT_SECONDS expired while holding
+    // for MCP readiness. With the default unlimited timeout, MCP readiness is an
+    // event wait like input readiness and transcript acceptance.
     McpNotReady,
     // custom: Claude Code wrote an API-error turn into the transcript and did
     // not fire Stop. Non-retryable errors and exhausted retry budgets fail fast
@@ -215,44 +214,21 @@ fn shellQuoteOne(allocator: std.mem.Allocator, out: *std.ArrayList(u8), s: []con
     try out.append(allocator, '\'');
 }
 
-/// How long the PTY output stream must be quiet before we believe Ink has
-/// finished its initial render and is ready to accept keystrokes. Smaller
-/// values type sooner; too small risks racing Ink's prompt-box draw. Tuned
-/// to 80 ms based on observed bursts (the input box renders in <50 ms of
-/// continuous output, then goes silent).
-const ink_quiescence_ms: u64 = 80;
-
-/// Upper bound on how long we'll wait for quiescence. If Ink keeps emitting
-/// output past this, we give up and type anyway; in practice the prompt box
-/// is always up by then, and the failure mode is identical to the previous
-/// fixed-sleep behavior.
-const ink_max_wait_ms: u64 = 2000;
-
 /// How long to wait between sending the prompt bytes and sending Enter.
 /// Ink's bracketed-paste heuristic merges back-to-back writes; without a
-/// gap, `\r` lands in the input buffer instead of triggering submit.
+/// gap, `\r` lands in the input buffer instead of triggering submit. This is a
+/// write-separation debounce, not a liveness timeout.
 const ink_enter_debounce_ms: u64 = 120;
 
-// --- custom (echo-confirmed input) ---
-// After typing the prompt, confirm it actually echoed into Ink's input box
-// before committing Enter, instead of trusting a blind debounce. Under
-// concurrent-boot CPU contention the SessionStart hook can fire while Ink's
-// input pipeline is not yet ready; the keystrokes are then dropped, the turn
-// never starts, and no Stop hook ever fires — the wrapper wedges until
-// --timeout. We poll the rolling `recent` PTY buffer for the prompt echo,
-// clear-line + retype on a miss, and fail fast rather than wedge.
-const echo_confirm_window_ms: u64 = 750; // per-attempt wait for the echo
-const echo_confirm_max_attempts: usize = 3;
+// PTY echo helpers remain for regression tests and diagnostics, but echo is no
+// longer the authoritative submission-acceptance gate.
 const echo_needle_max: usize = 48; // alnum chars of the prompt used as the echo needle
 
 // --- custom (MCP-readiness gate) ---
-// After the prompt echoes we HOLD the submit Enter until the MCP shim's
+// After the prompt paste completes we HOLD the submit Enter until the MCP shim's
 // readiness sentinel (Options.mcp_ready_file) appears, so the turn never
 // generates before the bridged `mcp__custom-tools__*` surface is live in
-// `claude`. `claude` requests tools/list at boot, so the shim normally raises
-// this within ~1-2s; a miss means the shim died or never attached, and we fail
-// fast (McpNotReady) rather than submit a tool-less prompt or wedge to --timeout.
-const mcp_ready_max_wait_ms: u64 = 20_000;
+// `claude`. This is an event wait, not a liveness timeout.
 
 // --- custom (API-error turn recovery) ---
 // Claude Code can flush an API-error assistant transcript record plus trailing

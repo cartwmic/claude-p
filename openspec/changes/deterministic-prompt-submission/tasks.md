@@ -38,7 +38,7 @@
   - files_allowed:
       - src/driver.zig
   - allow_new_files: false
-- [ ] 2.5 Preserve no-liveness-timeouts behavior: no submission/acceptance wall-clock cap, no retry clock, no `--timeout` reintroduction, and no elapsed-time-based `PromptNotAccepted`.
+- [x] 2.5 Preserve no-liveness-timeouts behavior: no submission/acceptance wall-clock cap, no retry clock, no `--timeout` reintroduction, and no elapsed-time-based `PromptNotAccepted`.
   - intent: fix
   - files_allowed:
       - src/driver.zig
