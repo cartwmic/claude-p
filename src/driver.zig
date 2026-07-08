@@ -426,6 +426,17 @@ fn detectApiErrorTurnEndFile(allocator: std.mem.Allocator, path: []const u8, bas
     return detectApiErrorTurnEnd(allocator, bytes, baseline_turns);
 }
 
+fn isUserRecordObject(obj: std.json.ObjectMap) bool {
+    const ty = obj.get("type") orelse return false;
+    return ty == .string and std.mem.eql(u8, ty.string, "user");
+}
+
+fn userPromptId(obj: std.json.ObjectMap) ?[]const u8 {
+    const id = obj.get("promptId") orelse return null;
+    if (id != .string or id.string.len == 0) return null;
+    return id.string;
+}
+
 fn userRecordCount(allocator: std.mem.Allocator, bytes: []const u8) !u32 {
     var count: u32 = 0;
     var line_iter = std.mem.splitScalar(u8, bytes, '\n');
@@ -444,10 +455,72 @@ fn userRecordCount(allocator: std.mem.Allocator, bytes: []const u8) !u32 {
 
         const root = parsed.value;
         if (root != .object) continue;
-        const ty = root.object.get("type") orelse continue;
-        if (ty == .string and std.mem.eql(u8, ty.string, "user")) count += 1;
+        if (isUserRecordObject(root.object)) count += 1;
     }
     return count;
+}
+
+fn clearPromptIds(allocator: std.mem.Allocator, prompt_ids: *std.StringHashMap(void)) void {
+    var key_it = prompt_ids.keyIterator();
+    while (key_it.next()) |key| allocator.free(key.*);
+    prompt_ids.clearRetainingCapacity();
+}
+
+fn collectUserPromptIds(allocator: std.mem.Allocator, bytes: []const u8, prompt_ids: *std.StringHashMap(void)) !u32 {
+    var count: u32 = 0;
+    var line_iter = std.mem.splitScalar(u8, bytes, '\n');
+    while (line_iter.next()) |raw_line| {
+        var line = raw_line;
+        if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
+        if (line.len == 0) continue;
+
+        var parsed = std.json.parseFromSlice(
+            std.json.Value,
+            allocator,
+            line,
+            .{ .ignore_unknown_fields = true },
+        ) catch continue;
+        defer parsed.deinit();
+
+        const root = parsed.value;
+        if (root != .object) continue;
+        const obj = root.object;
+        if (!isUserRecordObject(obj)) continue;
+        count += 1;
+        if (userPromptId(obj)) |pid| {
+            if (!prompt_ids.contains(pid)) {
+                const owned = try allocator.dupe(u8, pid);
+                errdefer allocator.free(owned);
+                try prompt_ids.put(owned, {});
+            }
+        }
+    }
+    return count;
+}
+
+fn hasNewUserPromptId(allocator: std.mem.Allocator, bytes: []const u8, baseline: TranscriptUserBaseline, prompt_ids: *std.StringHashMap(void)) !bool {
+    var line_iter = std.mem.splitScalar(u8, bytes, '\n');
+    while (line_iter.next()) |raw_line| {
+        var line = raw_line;
+        if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
+        if (line.len == 0) continue;
+
+        var parsed = std.json.parseFromSlice(
+            std.json.Value,
+            allocator,
+            line,
+            .{ .ignore_unknown_fields = true },
+        ) catch continue;
+        defer parsed.deinit();
+
+        const root = parsed.value;
+        if (root != .object) continue;
+        const obj = root.object;
+        if (!isUserRecordObject(obj)) continue;
+        const pid = userPromptId(obj) orelse return !baseline.file_existed;
+        if (!prompt_ids.contains(pid)) return true;
+    }
+    return false;
 }
 
 const TranscriptUserBaseline = struct {
@@ -456,24 +529,25 @@ const TranscriptUserBaseline = struct {
     user_records: u32 = 0,
 };
 
-fn transcriptUserBaseline(allocator: std.mem.Allocator, bytes: []const u8) !TranscriptUserBaseline {
+fn transcriptUserBaseline(allocator: std.mem.Allocator, bytes: []const u8, prompt_ids: *std.StringHashMap(void)) !TranscriptUserBaseline {
     return .{
         .file_existed = true,
         .bytes_len = bytes.len,
-        .user_records = try userRecordCount(allocator, bytes),
+        .user_records = try collectUserPromptIds(allocator, bytes, prompt_ids),
     };
 }
 
-fn transcriptUserBaselineFile(allocator: std.mem.Allocator, path: ?[]const u8) TranscriptUserBaseline {
+fn transcriptUserBaselineFile(allocator: std.mem.Allocator, path: ?[]const u8, prompt_ids: *std.StringHashMap(void)) TranscriptUserBaseline {
+    clearPromptIds(allocator, prompt_ids);
     const p = path orelse return .{};
     const file = std.fs.cwd().openFile(p, .{}) catch return .{};
     defer file.close();
     const bytes = file.readToEndAlloc(allocator, 64 * 1024 * 1024) catch return .{};
     defer allocator.free(bytes);
-    return transcriptUserBaseline(allocator, bytes) catch .{};
+    return transcriptUserBaseline(allocator, bytes, prompt_ids) catch .{};
 }
 
-fn transcriptHasNewUserRecord(allocator: std.mem.Allocator, path: ?[]const u8, baseline: TranscriptUserBaseline) bool {
+fn transcriptHasNewUserRecord(allocator: std.mem.Allocator, path: ?[]const u8, baseline: TranscriptUserBaseline, prompt_ids: *std.StringHashMap(void)) bool {
     const p = path orelse return false;
     const file = std.fs.cwd().openFile(p, .{}) catch return false;
     defer file.close();
@@ -481,7 +555,7 @@ fn transcriptHasNewUserRecord(allocator: std.mem.Allocator, path: ?[]const u8, b
     defer allocator.free(bytes);
     if (bytes.len <= baseline.bytes_len) return false;
     const start: usize = @intCast(baseline.bytes_len);
-    return (userRecordCount(allocator, bytes[start..]) catch 0) > 0;
+    return hasNewUserPromptId(allocator, bytes[start..], baseline, prompt_ids) catch false;
 }
 
 fn captureTranscriptUserBaseline(
@@ -489,8 +563,9 @@ fn captureTranscriptUserBaseline(
     opts: Options,
     trace_start: i128,
     path: ?[]const u8,
+    prompt_ids: *std.StringHashMap(void),
 ) TranscriptUserBaseline {
-    const baseline = transcriptUserBaselineFile(allocator, path);
+    const baseline = transcriptUserBaselineFile(allocator, path, prompt_ids);
     traceFmt(opts, trace_start, "transcript user baseline captured: existed={}, bytes={d}, user_records={d}", .{ baseline.file_existed, baseline.bytes_len, baseline.user_records });
     return baseline;
 }
@@ -502,9 +577,10 @@ fn waitForTranscriptUserRecord(
     shared: *SharedState,
     path: ?[]const u8,
     baseline: TranscriptUserBaseline,
+    prompt_ids: *std.StringHashMap(void),
 ) RunError!void {
     while (true) {
-        if (transcriptHasNewUserRecord(allocator, path, baseline)) {
+        if (transcriptHasNewUserRecord(allocator, path, baseline, prompt_ids)) {
             trace(opts, trace_start, "transcript user-record acceptance confirmed");
             return;
         }
@@ -798,6 +874,9 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
     // transcript BEFORE the live prompt is submitted. The live prompt is
     // accepted only when the active transcript gains another user record.
     var baseline_user_record: TranscriptUserBaseline = .{};
+    var baseline_user_prompt_ids = std.StringHashMap(void).init(allocator);
+    defer baseline_user_prompt_ids.deinit();
+    defer clearPromptIds(allocator, &baseline_user_prompt_ids);
     // Resume BILLING baseline: the deduped usage already in the transcript before
     // submit. The final result's usage is the post-turn deduped total MINUS this,
     // so result.usage reflects only the live turn (mirroring `claude -p`, which
@@ -838,7 +917,7 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
                     std.Thread.sleep(ink_enter_debounce_ms * std.time.ns_per_ms);
                     session.send("", true) catch {};
                     trace(opts, trace_start, "MCP surface ready; Enter sent; waiting for transcript user-record acceptance");
-                    try waitForTranscriptUserRecord(allocator, opts, trace_start, &shared, transcript_path, baseline_user_record);
+                    try waitForTranscriptUserRecord(allocator, opts, trace_start, &shared, transcript_path, baseline_user_record, &baseline_user_prompt_ids);
                     trace(opts, trace_start, "transcript accepted prompt; waiting on claude API");
                     state = .awaiting_stop;
                 }
@@ -922,7 +1001,7 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
                                 // turn; the live prompt must create a new user record
                                 // before any assistant Stop/result is trusted.
                                 baseline_turns = transcript_mod.turnCountFile(allocator, transcript_path);
-                                baseline_user_record = captureTranscriptUserBaseline(allocator, opts, trace_start, transcript_path);
+                                baseline_user_record = captureTranscriptUserBaseline(allocator, opts, trace_start, transcript_path, &baseline_user_prompt_ids);
                                 baseline_usage = transcript_mod.usageFile(allocator, transcript_path);
                                 traceFmt(opts, trace_start, "submit baselines before Enter: assistant_turns={d}, user_records={d}, bytes={d}", .{ baseline_turns, baseline_user_record.user_records, baseline_user_record.bytes_len });
 
@@ -933,7 +1012,7 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
                                     std.Thread.sleep(ink_enter_debounce_ms * std.time.ns_per_ms);
                                     session.send("", true) catch {};
                                     trace(opts, trace_start, "Enter sent; waiting for transcript user-record acceptance");
-                                    try waitForTranscriptUserRecord(allocator, opts, trace_start, &shared, transcript_path, baseline_user_record);
+                                    try waitForTranscriptUserRecord(allocator, opts, trace_start, &shared, transcript_path, baseline_user_record, &baseline_user_prompt_ids);
                                     trace(opts, trace_start, "transcript accepted prompt; waiting on claude API");
                                     state = .awaiting_stop;
                                 }
@@ -1027,7 +1106,7 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
                         std.Thread.sleep(backoff_ms * std.time.ns_per_ms);
 
                         baseline_turns = transcript_mod.turnCountFile(allocator, transcript_path);
-                        baseline_user_record = captureTranscriptUserBaseline(allocator, opts, trace_start, transcript_path);
+                        baseline_user_record = captureTranscriptUserBaseline(allocator, opts, trace_start, transcript_path, &baseline_user_prompt_ids);
                         baseline_usage = transcript_mod.usageFile(allocator, transcript_path);
                         traceFmt(opts, trace_start, "submit baselines reset after API error: assistant_turns={d}, user_records={d}, bytes={d}", .{ baseline_turns, baseline_user_record.user_records, baseline_user_record.bytes_len });
 
@@ -1037,7 +1116,7 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
                         std.Thread.sleep(ink_enter_debounce_ms * std.time.ns_per_ms);
                         session.send("", true) catch {};
                         trace(opts, trace_start, "retry Enter sent; waiting for transcript user-record acceptance");
-                        try waitForTranscriptUserRecord(allocator, opts, trace_start, &shared, transcript_path, baseline_user_record);
+                        try waitForTranscriptUserRecord(allocator, opts, trace_start, &shared, transcript_path, baseline_user_record, &baseline_user_prompt_ids);
                         trace(opts, trace_start, "transcript accepted retry prompt; waiting on claude API");
                     } else {
                         setLastApiErrorMessage(failed_attempts, turn.text);
@@ -1303,21 +1382,25 @@ test "missing transcript baseline does not block fresh-session acceptance" {
 test "transcript baseline accepts only user records after baseline offset" {
     // AC: prompt-echo-confirmation.transcript-user-record-confirms-submission
     const before =
-        \\{"type":"user","sessionId":"s","message":{"content":[{"type":"text","text":"prior"}]}}
+        \\{"promptId":"p1","type":"user","sessionId":"s","message":{"content":[{"type":"text","text":"prior"}]}}
         \\{"type":"assistant","sessionId":"s","message":{"content":[{"type":"text","text":"old"}]}}
         \\
     ;
     const after =
-        \\{"type":"user","sessionId":"s","message":{"content":[{"type":"text","text":"prior"}]}}
+        \\{"promptId":"p1","type":"user","sessionId":"s","message":{"content":[{"type":"text","text":"prior"}]}}
         \\{"type":"assistant","sessionId":"s","message":{"content":[{"type":"text","text":"old"}]}}
-        \\{"type":"user","sessionId":"s","message":{"content":[{"type":"text","text":"live"}]}}
+        \\{"promptId":"p2","type":"user","sessionId":"s","message":{"content":[{"type":"text","text":"live"}]}}
         \\
     ;
-    const baseline = try transcriptUserBaseline(testing.allocator, before);
+    var prompt_ids = std.StringHashMap(void).init(testing.allocator);
+    defer prompt_ids.deinit();
+    defer clearPromptIds(testing.allocator, &prompt_ids);
+    const baseline = try transcriptUserBaseline(testing.allocator, before, &prompt_ids);
     try testing.expectEqual(@as(u32, 1), baseline.user_records);
+    try testing.expect(prompt_ids.contains("p1"));
     try testing.expectEqual(@as(u64, before.len), baseline.bytes_len);
     try testing.expectEqual(baseline.user_records, try userRecordCount(testing.allocator, after[0..baseline.bytes_len]));
-    try testing.expect((try userRecordCount(testing.allocator, after[baseline.bytes_len..])) > 0);
+    try testing.expect(try hasNewUserPromptId(testing.allocator, after[baseline.bytes_len..], baseline, &prompt_ids));
 }
 
 test "replayed echo or paste marker does not confirm without transcript user record" {
@@ -1330,13 +1413,16 @@ test "replayed echo or paste marker does not confirm without transcript user rec
     try testing.expect(echoConfirms(hay, "WHATIS22", stripped));
 
     const transcript =
-        \\{"type":"user","sessionId":"s","message":{"content":[{"type":"text","text":"what is 2+2?"}]}}
+        \\{"promptId":"same","type":"user","sessionId":"s","message":{"content":[{"type":"text","text":"what is 2+2?"}]}}
         \\{"type":"assistant","sessionId":"s","message":{"content":[{"type":"text","text":"4"}]}}
         \\
     ;
-    const baseline = try userRecordCount(testing.allocator, transcript);
-    try testing.expectEqual(@as(u32, 1), baseline);
-    try testing.expect(!((try userRecordCount(testing.allocator, transcript)) > baseline));
+    var prompt_ids = std.StringHashMap(void).init(testing.allocator);
+    defer prompt_ids.deinit();
+    defer clearPromptIds(testing.allocator, &prompt_ids);
+    const baseline = try transcriptUserBaseline(testing.allocator, transcript, &prompt_ids);
+    try testing.expectEqual(@as(u32, 1), baseline.user_records);
+    try testing.expect(!try hasNewUserPromptId(testing.allocator, transcript, baseline, &prompt_ids));
 }
 
 test "submission acceptance has no elapsed-time or echo-window failure path" {
