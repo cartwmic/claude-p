@@ -5,9 +5,13 @@
 **Generated:** 2026-07-07 by pi / openspec-loop
 **Change:** deterministic-prompt-submission
 
+Status: green
+Diff Base SHA: 3fdbcd3923f54b55f7e3a5f6dce7cb20224b686f
+Reviewed Range: 3fdbcd3923f54b55f7e3a5f6dce7cb20224b686f..2e1f1b2c31f44255fd91de4b7061da4549e38657
+
 ## Completion Decision
 
-**Status:** green
+Status: green
 
 ## Checks
 
