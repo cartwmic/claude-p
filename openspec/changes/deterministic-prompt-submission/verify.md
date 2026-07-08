@@ -1,7 +1,5 @@
 # Verify
 
-<!-- authored: in-session -->
-
 **Generated:** 2026-07-07 by pi / openspec-loop
 **Change:** deterministic-prompt-submission
 
