@@ -272,6 +272,10 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) ParseError!
             // claude's print mode is what we *emulate*. Passing it through
             // would either no-op or fight with our hooks. Reject loudly.
             return ParseError.UnsupportedFlag;
+        } else if (std.mem.eql(u8, a, "--remote-control") or std.mem.startsWith(u8, a, "--remote-control=")) {
+            // Remote Control is a cloud-relayed/device-enrolled path and not a
+            // local deterministic input channel for this interactive driver.
+            return ParseError.UnsupportedFlag;
         } else if (std.mem.eql(u8, a, "--settings")) {
             // We inject our own --settings with the SessionStart/Stop hooks.
             // Accepting a user --settings would clobber that and break the
@@ -555,6 +559,11 @@ test "parse: --fallback-model is explicit" {
 test "parse: rejects --print (claude print mode is unavailable here)" {
     try testing.expectError(ParseError.UnsupportedFlag, parse(testing.allocator, &.{ "-p", "hi" }));
     try testing.expectError(ParseError.UnsupportedFlag, parse(testing.allocator, &.{ "--print", "hi" }));
+}
+
+test "parse: rejects remote-control" {
+    try testing.expectError(ParseError.UnsupportedFlag, parse(testing.allocator, &.{ "--remote-control", "hi" }));
+    try testing.expectError(ParseError.UnsupportedFlag, parse(testing.allocator, &.{ "--remote-control=phone", "hi" }));
 }
 
 test "parse: rejects user --settings (conflicts with our hook injection)" {
