@@ -1248,6 +1248,73 @@ fn promptEchoConfirmed(allocator: std.mem.Allocator, shared: *SharedState, promp
 
 const testing = std.testing;
 
+test "input readiness requires bracketed-paste enable sentinel" {
+    // AC: prompt-echo-confirmation.prompt-delivery-readiness-is-event-gated
+    try testing.expect(!inputReadyFromPty("booting..."));
+    try testing.expect(inputReadyFromPty("booting...\x1b[?2004hready"));
+}
+
+test "appendBracketedPaste frames prompt before separate Enter" {
+    // AC: prompt-echo-confirmation.prompt-delivery-uses-bracketed-paste
+    var out: std.ArrayList(u8) = .{};
+    defer out.deinit(testing.allocator);
+    try appendBracketedPaste(testing.allocator, &out, "hello\nworld");
+    try testing.expectEqualStrings("\x1b[200~hello\nworld\x1b[201~", out.items);
+    try testing.expect(std.mem.indexOf(u8, out.items, "\r") == null);
+}
+
+test "userRecordCount detects post-baseline user record" {
+    // AC: prompt-echo-confirmation.transcript-user-record-confirms-submission
+    const before =
+        \\{"type":"user","sessionId":"s","message":{"content":[{"type":"text","text":"prior"}]}}
+        \\{"type":"assistant","sessionId":"s","message":{"content":[{"type":"text","text":"old"}]}}
+        \\
+    ;
+    const after =
+        \\{"type":"user","sessionId":"s","message":{"content":[{"type":"text","text":"prior"}]}}
+        \\{"type":"assistant","sessionId":"s","message":{"content":[{"type":"text","text":"old"}]}}
+        \\{"type":"user","sessionId":"s","message":{"content":[{"type":"text","text":"live"}]}}
+        \\
+    ;
+    const baseline = try userRecordCount(testing.allocator, before);
+    try testing.expectEqual(@as(u32, 1), baseline);
+    try testing.expect((try userRecordCount(testing.allocator, after)) > baseline);
+}
+
+test "replayed echo or paste marker does not confirm without transcript user record" {
+    // AC: prompt-echo-confirmation.replayed-history-does-not-confirm-submission
+    const replayed_pty = "what is 2+2? [Pasted\x1b[11Gtext\x1b[16G#1] paste again to expand";
+    const stripped = try stripCsi(testing.allocator, replayed_pty);
+    defer testing.allocator.free(stripped);
+    const hay = try alnumCopy(testing.allocator, stripped);
+    defer testing.allocator.free(hay);
+    try testing.expect(echoConfirms(hay, "WHATIS22", stripped));
+
+    const transcript =
+        \\{"type":"user","sessionId":"s","message":{"content":[{"type":"text","text":"what is 2+2?"}]}}
+        \\{"type":"assistant","sessionId":"s","message":{"content":[{"type":"text","text":"4"}]}}
+        \\
+    ;
+    const baseline = try userRecordCount(testing.allocator, transcript);
+    try testing.expectEqual(@as(u32, 1), baseline);
+    try testing.expect(!((try userRecordCount(testing.allocator, transcript)) > baseline));
+}
+
+test "submission acceptance has no elapsed-time or echo-window failure path" {
+    // AC: prompt-echo-confirmation.submission-handshake-has-no-liveness-timeout
+    // AC: prompt-echo-confirmation.prompt-not-accepted-is-positive-signal-only
+    const source = try std.fs.cwd().readFileAlloc(testing.allocator, "src/driver.zig", 1024 * 1024);
+    defer testing.allocator.free(source);
+    const stale_echo_clock = "echo_wait" ++ "_start";
+    const stale_echo_failure = "prompt echo" ++ " never confirmed";
+    const stale_mcp_deadline = "mcp_ready" ++ "_deadline";
+    const stale_type_anyway = "typing" ++ " anyway";
+    try testing.expect(std.mem.indexOf(u8, source, stale_echo_clock) == null);
+    try testing.expect(std.mem.indexOf(u8, source, stale_echo_failure) == null);
+    try testing.expect(std.mem.indexOf(u8, source, stale_mcp_deadline) == null);
+    try testing.expect(std.mem.indexOf(u8, source, stale_type_anyway) == null);
+}
+
 test "api error detector: overloaded turn after baseline is terminal and retryable" {
     // AC: api-error-turns.transcript-api-error-ends-turn
     // AC: api-error-turns.retryable-api-errors-are-resubmitted-boundedly

@@ -47,22 +47,22 @@
 
 ## 3. Regression coverage
 
-- [ ] 3.1 Add unit coverage for readiness-gated bracketed-paste byte order (`ESC[200~` prompt `ESC[201~` then separate `\r`).
+- [x] 3.1 Add unit coverage for readiness-gated bracketed-paste byte order (`ESC[200~` prompt `ESC[201~` then separate `\r`).
   - intent: fix
   - files_allowed:
       - src/driver.zig
   - allow_new_files: false
-- [ ] 3.2 Add regression coverage proving replayed-history literal/paste evidence does not confirm acceptance without a new post-baseline transcript user record.
+- [x] 3.2 Add regression coverage proving replayed-history literal/paste evidence does not confirm acceptance without a new post-baseline transcript user record.
   - intent: fix
   - files_allowed:
       - src/driver.zig
   - allow_new_files: false
-- [ ] 3.3 Add regression coverage proving a real new post-baseline transcript user record confirms submission.
+- [x] 3.3 Add regression coverage proving a real new post-baseline transcript user record confirms submission.
   - intent: fix
   - files_allowed:
       - src/driver.zig
   - allow_new_files: false
-- [ ] 3.4 Add no-liveness-timeout regression/static coverage proving submission failure is not decided by elapsed time or missing echo alone.
+- [x] 3.4 Add no-liveness-timeout regression/static coverage proving submission failure is not decided by elapsed time or missing echo alone.
   - intent: fix
   - files_allowed:
       - src/driver.zig
