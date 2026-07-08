@@ -18,7 +18,7 @@
 
 ## 2. Driver submission implementation
 
-- [ ] 2.1 Add an event-based readiness gate that waits for the child PTY to emit `ESC[?2004h` before prompt delivery.
+- [x] 2.1 Add an event-based readiness gate that waits for the child PTY to emit `ESC[?2004h` before prompt delivery.
   - intent: fix
   - files_allowed:
       - src/driver.zig

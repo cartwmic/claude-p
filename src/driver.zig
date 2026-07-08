@@ -466,27 +466,26 @@ fn fileExists(path: []const u8) bool {
     return true;
 }
 
-/// Block until the child PTY has been quiet for at least `ink_quiescence_ms`,
-/// up to a cap of `ink_max_wait_ms`. Replaces the hardcoded "give Ink time
-/// to settle" sleep from the original fix — adapts to whatever boot latency
-/// the machine actually has.
-fn waitForInkQuiescent(opts: Options, trace_start: i128, shared: *SharedState) void {
-    const quiescence_ns: i64 = @intCast(ink_quiescence_ms * std.time.ns_per_ms);
-    const max_ns: i64 = @intCast(ink_max_wait_ms * std.time.ns_per_ms);
-    const wait_started: i64 = @intCast(std.time.nanoTimestamp());
+const bracketed_paste_enable = "\x1b[?2004h";
+
+fn inputReadyFromPty(bytes: []const u8) bool {
+    return std.mem.indexOf(u8, bytes, bracketed_paste_enable) != null;
+}
+
+/// Block until the host TUI emits the bracketed-paste-enable sentinel. This is
+/// an event wait, not a liveness timeout: the driver never "types anyway" based
+/// on elapsed time. If the child exits before readiness, surface the terminal
+/// spawn failure instead of racing a dead input surface.
+fn waitForInputReadiness(opts: Options, trace_start: i128, shared: *SharedState) RunError!void {
     while (true) {
-        const now: i64 = @intCast(std.time.nanoTimestamp());
-        if (now - wait_started > max_ns) {
-            traceFmt(opts, trace_start, "Ink readiness wait hit max ({d}ms) — typing anyway", .{ink_max_wait_ms});
+        shared.recent_mutex.lock();
+        const ready = inputReadyFromPty(shared.recent.items);
+        shared.recent_mutex.unlock();
+        if (ready) {
+            trace(opts, trace_start, "input readiness confirmed (ESC[?2004h seen)");
             return;
         }
-        const last: i64 = shared.last_output_ns.load(.seq_cst);
-        if (last != 0 and now - last > quiescence_ns) {
-            const since_ms: i64 = @divTrunc(now - last, std.time.ns_per_ms);
-            const waited_ms: i64 = @divTrunc(now - wait_started, std.time.ns_per_ms);
-            traceFmt(opts, trace_start, "Ink quiescent (output silent for {d}ms, waited {d}ms total)", .{ since_ms, waited_ms });
-            return;
-        }
+        if (shared.exited.load(.seq_cst)) return RunError.SpawnFailed;
         std.Thread.sleep(15 * std.time.ns_per_ms);
     }
 }
@@ -837,14 +836,12 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
                                 }
                             }
                             if (state == .waiting_for_ready) {
-                                // Wait for Ink to finish its initial render
-                                // before sending keystrokes. Signal: the PTY
-                                // output stream has been quiet for the
-                                // quiescence threshold below. Adaptive —
-                                // fast machines proceed in <100 ms, slow
-                                // ones get up to ink_max_wait_ms before we
-                                // give up and type anyway.
-                                waitForInkQuiescent(opts, trace_start, &shared);
+                                // Wait for the host input surface itself, not
+                                // a quiescence timer. `ESC[?2004h` means Claude
+                                // Code has enabled bracketed paste for the live
+                                // prompt box; until then, prompt bytes can be
+                                // dropped by the not-yet-ready TUI.
+                                try waitForInputReadiness(opts, trace_start, &shared);
 
                                 // custom (echo-confirmed input): type the
                                 // prompt, then CONFIRM it echoed into Ink's
