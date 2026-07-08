@@ -553,9 +553,7 @@ fn transcriptHasNewUserRecord(allocator: std.mem.Allocator, path: ?[]const u8, b
     defer file.close();
     const bytes = file.readToEndAlloc(allocator, 64 * 1024 * 1024) catch return false;
     defer allocator.free(bytes);
-    if (bytes.len <= baseline.bytes_len) return false;
-    const start: usize = @intCast(baseline.bytes_len);
-    return hasNewUserPromptId(allocator, bytes[start..], baseline, prompt_ids) catch false;
+    return hasNewUserPromptId(allocator, bytes, baseline, prompt_ids) catch false;
 }
 
 fn captureTranscriptUserBaseline(

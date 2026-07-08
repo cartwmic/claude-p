@@ -268,7 +268,9 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) ParseError!
             i = try consumeVariadicInto(allocator, argv, i, &opts.add_dirs);
         } else if (std.mem.eql(u8, a, "--mcp-config")) {
             i = try consumeVariadicInto(allocator, argv, i, &opts.mcp_configs);
-        } else if (std.mem.eql(u8, a, "-p") or std.mem.eql(u8, a, "--print")) {
+        } else if (std.mem.eql(u8, a, "-p") or std.mem.startsWith(u8, a, "-p=") or
+            std.mem.eql(u8, a, "--print") or std.mem.startsWith(u8, a, "--print="))
+        {
             // claude's print mode is what we *emulate*. Passing it through
             // would either no-op or fight with our hooks. Reject loudly.
             return ParseError.UnsupportedFlag;
@@ -558,7 +560,9 @@ test "parse: --fallback-model is explicit" {
 
 test "parse: rejects --print (claude print mode is unavailable here)" {
     try testing.expectError(ParseError.UnsupportedFlag, parse(testing.allocator, &.{ "-p", "hi" }));
+    try testing.expectError(ParseError.UnsupportedFlag, parse(testing.allocator, &.{ "-p=true", "hi" }));
     try testing.expectError(ParseError.UnsupportedFlag, parse(testing.allocator, &.{ "--print", "hi" }));
+    try testing.expectError(ParseError.UnsupportedFlag, parse(testing.allocator, &.{ "--print=true", "hi" }));
 }
 
 test "parse: rejects remote-control" {
