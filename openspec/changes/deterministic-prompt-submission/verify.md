@@ -5,7 +5,7 @@
 
 Status: green
 Diff Base SHA: 3fdbcd3923f54b55f7e3a5f6dce7cb20224b686f
-Reviewed Range: 3fdbcd3923f54b55f7e3a5f6dce7cb20224b686f..02b8969f18a50308bb9ac2c27a6f97bd72ff7790
+Reviewed Range: 3fdbcd3923f54b55f7e3a5f6dce7cb20224b686f..c62cf19aa42ef48585900054028343cb24a7f430
 
 ## Completion Decision
 
@@ -57,6 +57,7 @@ Status: green
 ## Validation commands run
 
 - `zig build test` — PASS
+- `zig build test-integration` — PASS (compile + skipped runtime unless `CLAUDE_P_E2E=1`)
 - `zig build -Doptimize=ReleaseSafe` — PASS
 - `openspec validate deterministic-prompt-submission --strict` — PASS
 - `openspec validate --specs --strict` — PASS
