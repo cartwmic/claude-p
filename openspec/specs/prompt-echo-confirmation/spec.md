@@ -3,9 +3,7 @@
 ## Purpose
 
 Defines how `claude-p` delivers a prompt to the interactive Claude Code TUI and confirms submission acceptance without relying on PTY echo as authoritative evidence. Prompt delivery is gated by an input-readiness event, prompt bytes are sent as bracketed paste, and acceptance is confirmed by a new post-baseline user-message record in the active Claude Code session transcript. Submission waits are event-based and do not use liveness timeouts.
-
 ## Requirements
-
 ### Requirement: Prompt Delivery Readiness Is Event-Gated
 
 `claude-p` SHALL NOT write prompt bytes to the host TUI until the host input surface has emitted an approved readiness event.
@@ -90,3 +88,4 @@ Text rendered from resume history, prior turns, prompt echoes, or collapsed-past
 #### Scenario: Echo evidence is absent
 - **WHEN** literal echo, paste-collapse marker, and paste-collapse hint evidence are absent from the PTY recent buffer
 - **THEN** the driver SHALL NOT exit with `PromptNotAccepted` due solely to absent echo evidence
+
