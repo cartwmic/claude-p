@@ -23,7 +23,7 @@
   - files_allowed:
       - src/driver.zig
   - allow_new_files: false
-- [ ] 2.2 Replace raw prompt typing with explicit bracketed-paste delivery while preserving submit Enter as a separate PTY write after `ESC[201~` and after the existing MCP ready-file hold.
+- [x] 2.2 Replace raw prompt typing with explicit bracketed-paste delivery while preserving submit Enter as a separate PTY write after `ESC[201~` and after the existing MCP ready-file hold.
   - intent: fix
   - files_allowed:
       - src/driver.zig

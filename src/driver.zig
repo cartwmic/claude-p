@@ -467,6 +467,8 @@ fn fileExists(path: []const u8) bool {
 }
 
 const bracketed_paste_enable = "\x1b[?2004h";
+const bracketed_paste_start = "\x1b[200~";
+const bracketed_paste_end = "\x1b[201~";
 
 fn inputReadyFromPty(bytes: []const u8) bool {
     return std.mem.indexOf(u8, bytes, bracketed_paste_enable) != null;
@@ -488,6 +490,18 @@ fn waitForInputReadiness(opts: Options, trace_start: i128, shared: *SharedState)
         if (shared.exited.load(.seq_cst)) return RunError.SpawnFailed;
         std.Thread.sleep(15 * std.time.ns_per_ms);
     }
+}
+
+fn appendBracketedPaste(allocator: std.mem.Allocator, out: *std.ArrayList(u8), prompt: []const u8) !void {
+    try out.appendSlice(allocator, bracketed_paste_start);
+    try out.appendSlice(allocator, prompt);
+    try out.appendSlice(allocator, bracketed_paste_end);
+}
+
+fn writeBracketedPaste(session: anytype, prompt: []const u8) !void {
+    try session.writeInput(bracketed_paste_start);
+    try session.writeInput(prompt);
+    try session.writeInput(bracketed_paste_end);
 }
 
 /// Emit a debug-gated trace line to stderr with the elapsed time since
@@ -866,8 +880,8 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
                                         session.send("\x15", false) catch {};
                                         std.Thread.sleep(40 * std.time.ns_per_ms);
                                     }
-                                    traceFmt(opts, trace_start, "typing prompt ({d} bytes), attempt {d}", .{ opts.prompt.len, attempt + 1 });
-                                    session.send(opts.prompt, false) catch {};
+                                    traceFmt(opts, trace_start, "pasting prompt ({d} bytes), attempt {d}", .{ opts.prompt.len, attempt + 1 });
+                                    writeBracketedPaste(session, opts.prompt) catch {};
 
                                     const echo_window_ns: i64 = @intCast(echo_confirm_window_ms * std.time.ns_per_ms);
                                     const echo_wait_start: i64 = @intCast(std.time.nanoTimestamp());
@@ -1014,8 +1028,8 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
                                 std.Thread.sleep(40 * std.time.ns_per_ms);
                                 clearRecent(&shared);
                             }
-                            traceFmt(opts, trace_start, "retyping prompt after API error ({d} bytes), attempt {d}", .{ opts.prompt.len, attempt + 1 });
-                            session.send(opts.prompt, false) catch {};
+                            traceFmt(opts, trace_start, "repasting prompt after API error ({d} bytes), attempt {d}", .{ opts.prompt.len, attempt + 1 });
+                            writeBracketedPaste(session, opts.prompt) catch {};
 
                             const echo_window_ns: i64 = @intCast(echo_confirm_window_ms * std.time.ns_per_ms);
                             const echo_wait_start: i64 = @intCast(std.time.nanoTimestamp());
