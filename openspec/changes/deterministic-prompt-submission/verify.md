@@ -5,7 +5,7 @@
 
 Status: green
 Diff Base SHA: 3fdbcd3923f54b55f7e3a5f6dce7cb20224b686f
-Reviewed Range: 3fdbcd3923f54b55f7e3a5f6dce7cb20224b686f..21e4fe5d7975c23f1ad5f6751fc1256bce477918
+Reviewed Range: 3fdbcd3923f54b55f7e3a5f6dce7cb20224b686f..d7c3f9382d46c3bfe8b1a981b5ddf5d27ca67514
 
 ## Completion Decision
 
@@ -62,8 +62,8 @@ Status: green
 - `openspec validate deterministic-prompt-submission --strict` — PASS
 - `openspec validate --specs --strict` — PASS
 - `opsx archive-check deterministic-prompt-submission` — PASS (base-currency OK after rebase)
-- Blind post-rebase code review (`/tmp/deterministic-prompt-submission-post-rebase-review.md`) — PASS
-- Blind post-rebase doneness (`/tmp/deterministic-prompt-submission-post-rebase-doneness.md`) — PASS
+- Blind post-rebase code review (`/tmp/deterministic-prompt-submission-post-rebase-review2.md`) — PASS
+- Blind post-rebase doneness (`/tmp/deterministic-prompt-submission-post-rebase-doneness2.md`) — PASS
 
 ## Summary
 

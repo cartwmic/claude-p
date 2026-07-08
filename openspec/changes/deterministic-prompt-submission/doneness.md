@@ -2,12 +2,12 @@
 
 **Doneness:** satisfied
 
-**Judge:** claude-bridge/claude-opus-4-8 via pi-subagents reviewer (`/tmp/deterministic-prompt-submission-post-rebase-doneness.md`)
+**Judge:** claude-bridge/claude-opus-4-8 via pi-subagents reviewer (`/tmp/deterministic-prompt-submission-post-rebase-doneness2.md`)
 **review_mode:** blind-single-judge
 **Frozen-Intent SHA:** 54db94ac4cd760d13273da1d8cac124867f226b4049cf91a8909027c55e249f8
-**Attested HEAD:** 21e4fe5d7975c23f1ad5f6751fc1256bce477918
+**Attested HEAD:** d7c3f9382d46c3bfe8b1a981b5ddf5d27ca67514
 **Diff Base SHA:** 3fdbcd3923f54b55f7e3a5f6dce7cb20224b686f
-**Reviewed Range:** 3fdbcd3923f54b55f7e3a5f6dce7cb20224b686f..21e4fe5d7975c23f1ad5f6751fc1256bce477918
+**Reviewed Range:** 3fdbcd3923f54b55f7e3a5f6dce7cb20224b686f..d7c3f9382d46c3bfe8b1a981b5ddf5d27ca67514
 
 ## Verdict rationale
 

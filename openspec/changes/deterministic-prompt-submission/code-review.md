@@ -3,10 +3,10 @@
 **Change:** deterministic-prompt-submission
 **Verdict:** pass
 **review_mode:** adversarial-multimodel
-**reviewer-provenance:** pi-subagents reviewer output `/tmp/deterministic-prompt-submission-post-rebase-review.md` (openai-codex/gpt-5.5), after prior adversarial multimodel rounds `/Users/cartwmic/tmp/deterministic-prompt-submission-review10-opus.md` and `/Users/cartwmic/tmp/deterministic-prompt-submission-review10-gpt55.md`
+**reviewer-provenance:** pi-subagents reviewer output `/tmp/deterministic-prompt-submission-post-rebase-review2.md` (openai-codex/gpt-5.5), after prior adversarial multimodel rounds `/Users/cartwmic/tmp/deterministic-prompt-submission-review10-opus.md` and `/Users/cartwmic/tmp/deterministic-prompt-submission-review10-gpt55.md`
 **Diff Base SHA:** 3fdbcd3923f54b55f7e3a5f6dce7cb20224b686f
-**Reviewed Range:** 3fdbcd3923f54b55f7e3a5f6dce7cb20224b686f..21e4fe5d7975c23f1ad5f6751fc1256bce477918
-**Attested HEAD:** 21e4fe5d7975c23f1ad5f6751fc1256bce477918
+**Reviewed Range:** 3fdbcd3923f54b55f7e3a5f6dce7cb20224b686f..d7c3f9382d46c3bfe8b1a981b5ddf5d27ca67514
+**Attested HEAD:** d7c3f9382d46c3bfe8b1a981b5ddf5d27ca67514
 **Baseline:** intent.md + proposal + specs + constitution + domain + plan + tasks status + verify
 **Generated:** 2026-07-08
 
@@ -29,6 +29,7 @@ Gating FAIL only for frozen-baseline violation or objective correctness/security
 | 9 | blind | 0 | 2 | 0 | 0 | opus:pass gpt-5.5:fail | 85ffe00d56ef87160359d8b7bbd31b30e3151e0c |
 | 10 | blind | 0 | 0 | 0 | 3 | opus:pass gpt-5.5:pass | 59901622fad4cf807950f8e77d208b2b1734d89b |
 | 11 | blind post-rebase | 0 | 0 | 0 | 0 | gpt-5.5:pass | 21e4fe5d7975c23f1ad5f6751fc1256bce477918 |
+| 12 | blind artifact-refresh | 0 | 0 | 0 | 0 | gpt-5.5:pass | d7c3f9382d46c3bfe8b1a981b5ddf5d27ca67514 |
 
 ## Findings
 
@@ -54,4 +55,4 @@ Gating FAIL only for frozen-baseline violation or objective correctness/security
 
 ## Verdict rationale
 
-Post-rebase blind reviewer attested worktree HEAD `21e4fe5d7975c23f1ad5f6751fc1256bce477918` and returned `PASS` for current rebased tree; artifact reviewed range is recorded against frozen diff base `3fdbcd3923f54b55f7e3a5f6dce7cb20224b686f..21e4fe5d7975c23f1ad5f6751fc1256bce477918` per opsx gate contract. No open P0/P1 remain. Code review is sealed pass.
+Post-rebase artifact-refresh blind reviewer attested worktree HEAD `d7c3f9382d46c3bfe8b1a981b5ddf5d27ca67514` and returned `PASS` for current rebased tree; artifact reviewed range is recorded against frozen diff base `3fdbcd3923f54b55f7e3a5f6dce7cb20224b686f..d7c3f9382d46c3bfe8b1a981b5ddf5d27ca67514` per opsx gate contract. No open P0/P1 remain. Code review is sealed pass.
