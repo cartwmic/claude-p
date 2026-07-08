@@ -3,12 +3,12 @@
 **Change:** deterministic-prompt-submission
 **Verdict:** pass
 **review_mode:** adversarial-multimodel
-**reviewer-provenance:** pi-subagents reviewer outputs `/Users/cartwmic/tmp/deterministic-prompt-submission-review10-opus.md` (claude-bridge/claude-opus-4-8) and `/Users/cartwmic/tmp/deterministic-prompt-submission-review10-gpt55.md` (openai-codex/gpt-5.5)
-**Diff Base SHA:** 3fdbcd3923f54b55f7e3a5f6dce7cb20224b686f
-**Reviewed Range:** 3fdbcd3923f54b55f7e3a5f6dce7cb20224b686f..59901622fad4cf807950f8e77d208b2b1734d89b
-**Attested HEAD:** 59901622fad4cf807950f8e77d208b2b1734d89b
+**reviewer-provenance:** pi-subagents reviewer output `/tmp/deterministic-prompt-submission-post-rebase-review.md` (openai-codex/gpt-5.5), after prior adversarial multimodel rounds `/Users/cartwmic/tmp/deterministic-prompt-submission-review10-opus.md` and `/Users/cartwmic/tmp/deterministic-prompt-submission-review10-gpt55.md`
+**Diff Base SHA:** 79d258e434b6a2bde9f34adf0f28b7f5a6c82c88
+**Reviewed Range:** 79d258e434b6a2bde9f34adf0f28b7f5a6c82c88..21e4fe5d7975c23f1ad5f6751fc1256bce477918
+**Attested HEAD:** 21e4fe5d7975c23f1ad5f6751fc1256bce477918
 **Baseline:** intent.md + proposal + specs + constitution + domain + plan + tasks status + verify
-**Generated:** 2026-07-07
+**Generated:** 2026-07-08
 
 ## Verdict contract
 
@@ -28,12 +28,13 @@ Gating FAIL only for frozen-baseline violation or objective correctness/security
 | 8 | blind | 0 | 1 | 0 | 0 | opus:pass gpt-5.5:fail | 12e816f813dbf7e9f2fee325bee71ac9173bea01 |
 | 9 | blind | 0 | 2 | 0 | 0 | opus:pass gpt-5.5:fail | 85ffe00d56ef87160359d8b7bbd31b30e3151e0c |
 | 10 | blind | 0 | 0 | 0 | 3 | opus:pass gpt-5.5:pass | 59901622fad4cf807950f8e77d208b2b1734d89b |
+| 11 | blind post-rebase | 0 | 0 | 0 | 0 | gpt-5.5:pass | 21e4fe5d7975c23f1ad5f6751fc1256bce477918 |
 
 ## Findings
 
 | # | Finding | Severity | Status |
 |---|---|---|---|
-| 1 | None. Final quiet round reported no P0/P1 and no P2 findings; only P3 residual risks. | P3 | advisory |
+| 1 | None. Post-rebase blind review reported PASS with no blockers. | P0/P1 | resolved |
 
 ## Applied fixes
 
@@ -53,4 +54,4 @@ Gating FAIL only for frozen-baseline violation or objective correctness/security
 
 ## Verdict rationale
 
-Both blind reviewers attested the same worktree HEAD and returned `Verdict: pass` for reviewed range `3fdbcd3923f54b55f7e3a5f6dce7cb20224b686f..59901622fad4cf807950f8e77d208b2b1734d89b`. No open P0/P1 remain. Code review is sealed pass.
+Post-rebase blind reviewer attested worktree HEAD `21e4fe5d7975c23f1ad5f6751fc1256bce477918` and returned `PASS` for reviewed range `79d258e434b6a2bde9f34adf0f28b7f5a6c82c88..21e4fe5d7975c23f1ad5f6751fc1256bce477918`. No open P0/P1 remain. Code review is sealed pass.

@@ -2,13 +2,13 @@
 
 **Doneness:** satisfied
 
-**Judge:** claude-bridge/claude-opus-4-8 via pi-subagents reviewer (`/Users/cartwmic/tmp/deterministic-prompt-submission-doneness-opus.md`)
+**Judge:** claude-bridge/claude-opus-4-8 via pi-subagents reviewer (`/tmp/deterministic-prompt-submission-post-rebase-doneness.md`)
 **review_mode:** blind-single-judge
 **Frozen-Intent SHA:** 54db94ac4cd760d13273da1d8cac124867f226b4049cf91a8909027c55e249f8
-**Attested HEAD:** aefbbdbfe7286f6dba884f9e7595a929592340f0
-**Diff Base SHA:** 3fdbcd3923f54b55f7e3a5f6dce7cb20224b686f
-**Reviewed Range:** 3fdbcd3923f54b55f7e3a5f6dce7cb20224b686f..59901622fad4cf807950f8e77d208b2b1734d89b
+**Attested HEAD:** 21e4fe5d7975c23f1ad5f6751fc1256bce477918
+**Diff Base SHA:** 79d258e434b6a2bde9f34adf0f28b7f5a6c82c88
+**Reviewed Range:** 79d258e434b6a2bde9f34adf0f28b7f5a6c82c88..21e4fe5d7975c23f1ad5f6751fc1256bce477918
 
 ## Verdict rationale
 
-The frozen intent outcomes are satisfied: prompt delivery is readiness-gated on `ESC[?2004h`, delivered as bracketed paste with separate submit Enter, and accepted only via a post-baseline transcript user record keyed on promptId identity. Submission/acceptance waits are event waits with no liveness timeout; forbidden alternate channels (`-p`, `--print`, `--input-format`, `--remote-control`, `--timeout`) are rejected; warm-resume and fresh-session edge cases fail closed rather than false-accepting replayed history.
+The post-rebase blind judge found all frozen intent outcomes satisfied: prompt delivery is readiness-gated on `ESC[?2004h`, delivered as bracketed paste with separate submit Enter, and accepted only via a post-baseline transcript user record keyed on promptId identity. Submission/acceptance waits are event waits with no liveness timeout; forbidden alternate channels (`-p`, `--print`, `--input-format`, `--remote-control`, `--timeout`, `--settings`) are rejected; warm-resume and fresh-session edge cases fail closed rather than false-accepting replayed history. Post-rebase gates cited by the judge: `zig build test`, `openspec validate deterministic-prompt-submission --strict`, and `openspec validate --specs --strict` passed.

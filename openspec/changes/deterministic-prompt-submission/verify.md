@@ -1,11 +1,11 @@
 # Verify
 
-**Generated:** 2026-07-07 by pi / openspec-loop
+**Generated:** 2026-07-08 by pi / openspec-loop post-rebase refresh
 **Change:** deterministic-prompt-submission
 
 Status: green
-Diff Base SHA: 3fdbcd3923f54b55f7e3a5f6dce7cb20224b686f
-Reviewed Range: 3fdbcd3923f54b55f7e3a5f6dce7cb20224b686f..1c2b97a424951daa7dcb08eb08f8ae06115b2126
+Diff Base SHA: 79d258e434b6a2bde9f34adf0f28b7f5a6c82c88
+Reviewed Range: 79d258e434b6a2bde9f34adf0f28b7f5a6c82c88..21e4fe5d7975c23f1ad5f6751fc1256bce477918
 
 ## Completion Decision
 
@@ -18,7 +18,7 @@ Status: green
 | 1 | Structural validation (`openspec validate --strict --json`) | pass | `openspec validate deterministic-prompt-submission --strict` => `Change 'deterministic-prompt-submission' is valid`; `openspec validate --specs --strict` => `spec/prompt-echo-confirmation` passed |
 | 2 | Task completion (zero `- [ ]` in tasks.md) | pass | 0 unchecked after T4.1/T4.2 marked complete |
 | 3 | Delta vs current spec coherence | pass | Live `openspec/specs/prompt-echo-confirmation/spec.md` restates the same six requirements as the delta; constitution/domain restated consistently |
-| 4 | Commit hygiene (subject ≤72; body explains why) | pass | Worktree commits from `3fdbcd3..HEAD` have subjects ≤72 and are scoped to the change/implementation; rationale is carried in proposal/plan/task artifacts; review-fix commits address blind P0/P1 blockers |
+| 4 | Commit hygiene (subject ≤72; body explains why) | pass | Worktree commits from `79d258e..HEAD` have subjects ≤72 and are scoped to the change/implementation; rationale is carried in proposal/plan/task artifacts; review-fix commits address blind P0/P1 blockers |
 | 5 | AC↔test mapping (canonical IDs) | pass | All six new `prompt-echo-confirmation.*` AC IDs appear in `src/driver.zig` tests; changed test file references AC IDs |
 | 6 | Constitution compliance audit (sampling) | pass | All 6 changed files audited; no violation of I–IV; no `-p`/`--print`/remote-control path and no liveness timeout introduced |
 
@@ -61,6 +61,9 @@ Status: green
 - `zig build -Doptimize=ReleaseSafe` — PASS
 - `openspec validate deterministic-prompt-submission --strict` — PASS
 - `openspec validate --specs --strict` — PASS
+- `opsx archive-check deterministic-prompt-submission` — PASS (base-currency OK after rebase)
+- Blind post-rebase code review (`/tmp/deterministic-prompt-submission-post-rebase-review.md`) — PASS
+- Blind post-rebase doneness (`/tmp/deterministic-prompt-submission-post-rebase-doneness.md`) — PASS
 
 ## Summary
 
