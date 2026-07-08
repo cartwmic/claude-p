@@ -41,9 +41,6 @@ pub const Options = struct {
     session_id: ?[]const u8 = null,
     cwd: ?[]const u8 = null,
     verbose: bool = false,
-    /// Wall-time cap in seconds. 0 = unlimited (no cap). Default is unlimited;
-    /// an explicit --timeout or the CLAUDE_P_TIMEOUT_SECONDS env var re-imposes one.
-    timeout_seconds: u32 = 0,
     debug: bool = false,
     show_help: bool = false,
     show_version: bool = false,
@@ -140,8 +137,6 @@ const help_text =
     \\  --mcp-ready-file <path>         Hold submit until this sentinel exists
     \\  --mirror-file <path>            Tee raw PTY output bytes to this file (write-only observer)
     \\  --verbose                       Verbose output
-    \\  --timeout <seconds>             Wall-time cap; 0 = unlimited (default: 0,
-    \\                                  overridable via CLAUDE_P_TIMEOUT_SECONDS env)
     \\  --debug                         Wrapper debug logs to stderr
     \\  --                              End of options; remaining tokens go to PROMPT
     \\  -h, --help                      Print this help
@@ -163,7 +158,6 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) ParseError!
     errdefer opts.deinit(allocator);
 
     var seen_separator = false;
-    var timeout_from_flag = false;
     var i: usize = 0;
     while (i < argv.len) : (i += 1) {
         const a = argv[i];
@@ -242,11 +236,8 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) ParseError!
             opts.verbose = true;
         } else if (std.mem.eql(u8, a, "--debug")) {
             opts.debug = true;
-        } else if (std.mem.eql(u8, a, "--timeout")) {
-            i += 1;
-            if (i >= argv.len) return ParseError.MissingValue;
-            opts.timeout_seconds = std.fmt.parseInt(u32, argv[i], 10) catch return ParseError.BadInteger;
-            timeout_from_flag = true;
+        } else if (std.mem.eql(u8, a, "--timeout") or std.mem.startsWith(u8, a, "--timeout=")) {
+            return ParseError.UnsupportedFlag;
         } else if (std.mem.eql(u8, a, "--system-prompt")) {
             i += 1;
             if (i >= argv.len) return ParseError.MissingValue;
@@ -277,14 +268,24 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) ParseError!
             i = try consumeVariadicInto(allocator, argv, i, &opts.add_dirs);
         } else if (std.mem.eql(u8, a, "--mcp-config")) {
             i = try consumeVariadicInto(allocator, argv, i, &opts.mcp_configs);
-        } else if (std.mem.eql(u8, a, "-p") or std.mem.eql(u8, a, "--print")) {
+        } else if (std.mem.eql(u8, a, "-p") or std.mem.startsWith(u8, a, "-p=") or
+            std.mem.eql(u8, a, "--print") or std.mem.startsWith(u8, a, "--print="))
+        {
             // claude's print mode is what we *emulate*. Passing it through
             // would either no-op or fight with our hooks. Reject loudly.
             return ParseError.UnsupportedFlag;
-        } else if (std.mem.eql(u8, a, "--settings")) {
+        } else if (std.mem.eql(u8, a, "--remote-control") or std.mem.startsWith(u8, a, "--remote-control=")) {
+            // Remote Control is a cloud-relayed/device-enrolled path and not a
+            // local deterministic input channel for this interactive driver.
+            return ParseError.UnsupportedFlag;
+        } else if (std.mem.eql(u8, a, "--settings") or std.mem.startsWith(u8, a, "--settings=")) {
             // We inject our own --settings with the SessionStart/Stop hooks.
             // Accepting a user --settings would clobber that and break the
             // completion signal.
+            return ParseError.UnsupportedFlag;
+        } else if (std.mem.eql(u8, a, "--input-format") or std.mem.startsWith(u8, a, "--input-format=")) {
+            // Native stream-json input only belongs to Claude print mode; this
+            // wrapper intentionally drives the interactive TUI quota path.
             return ParseError.UnsupportedFlag;
         } else if (std.mem.startsWith(u8, a, "--")) {
             // Unknown long option — forward verbatim. For known boolean
@@ -307,18 +308,6 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) ParseError!
             // Subsequent positionals: concat lazily by appending the second
             // (we expect only one positional).
             return ParseError.UnknownFlag;
-        }
-    }
-
-    // Wall-time cap defaults to unlimited (0). When --timeout is absent, an
-    // optional CLAUDE_P_TIMEOUT_SECONDS env var can re-impose a cap. The CLI
-    // flag always wins when present; a value of 0 (flag or env) means unlimited.
-    // A non-numeric env value is ignored (stays unlimited) rather than fatal.
-    if (!timeout_from_flag) {
-        if (std.posix.getenv("CLAUDE_P_TIMEOUT_SECONDS")) |raw| {
-            if (raw.len > 0) {
-                opts.timeout_seconds = std.fmt.parseInt(u32, raw, 10) catch opts.timeout_seconds;
-            }
         }
     }
 
@@ -436,18 +425,9 @@ test "parse: --version" {
     try testing.expect(opts.show_version);
 }
 
-test "parse: --timeout" {
-    var opts = try parse(testing.allocator, &.{ "--timeout", "60", "hi" });
-    defer opts.deinit(testing.allocator);
-    try testing.expectEqual(@as(u32, 60), opts.timeout_seconds);
-}
-
-test "parse: timeout defaults to unlimited (0) when --timeout absent" {
-    // Env may inject a cap in some environments; this asserts the no-flag,
-    // no-env default. CLAUDE_P_TIMEOUT_SECONDS is unset under the test runner.
-    var opts = try parse(testing.allocator, &.{"hi"});
-    defer opts.deinit(testing.allocator);
-    try testing.expectEqual(@as(u32, 0), opts.timeout_seconds);
+test "parse: --timeout is rejected" {
+    try testing.expectError(ParseError.UnsupportedFlag, parse(testing.allocator, &.{ "--timeout", "60", "hi" }));
+    try testing.expectError(ParseError.UnsupportedFlag, parse(testing.allocator, &.{ "--timeout=60", "hi" }));
 }
 
 test "parse: --resume value" {
@@ -584,11 +564,24 @@ test "parse: --fallback-model is explicit" {
 
 test "parse: rejects --print (claude print mode is unavailable here)" {
     try testing.expectError(ParseError.UnsupportedFlag, parse(testing.allocator, &.{ "-p", "hi" }));
+    try testing.expectError(ParseError.UnsupportedFlag, parse(testing.allocator, &.{ "-p=true", "hi" }));
     try testing.expectError(ParseError.UnsupportedFlag, parse(testing.allocator, &.{ "--print", "hi" }));
+    try testing.expectError(ParseError.UnsupportedFlag, parse(testing.allocator, &.{ "--print=true", "hi" }));
+}
+
+test "parse: rejects remote-control" {
+    try testing.expectError(ParseError.UnsupportedFlag, parse(testing.allocator, &.{ "--remote-control", "hi" }));
+    try testing.expectError(ParseError.UnsupportedFlag, parse(testing.allocator, &.{ "--remote-control=phone", "hi" }));
 }
 
 test "parse: rejects user --settings (conflicts with our hook injection)" {
     try testing.expectError(ParseError.UnsupportedFlag, parse(testing.allocator, &.{ "--settings", "{}" }));
+    try testing.expectError(ParseError.UnsupportedFlag, parse(testing.allocator, &.{ "--settings={}", "hi" }));
+}
+
+test "parse: rejects native input-format" {
+    try testing.expectError(ParseError.UnsupportedFlag, parse(testing.allocator, &.{ "--input-format", "stream-json", "hi" }));
+    try testing.expectError(ParseError.UnsupportedFlag, parse(testing.allocator, &.{ "--input-format=stream-json", "hi" }));
 }
 
 test "parse: stream-json without --verbose is rejected (matches claude -p)" {

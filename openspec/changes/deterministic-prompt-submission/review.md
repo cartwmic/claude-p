@@ -53,7 +53,8 @@ review_budget_mode: quiet-round
 
 - 2026-07-07 — Intent is frozen at commit `124926b902ba52c8e5a7e725ecc7d714d8689ef7`; do not edit `intent.md` without owner re-authorization.
 - 2026-07-07 — Standing no-liveness-timeouts principle applies: no submission/acceptance wall-clock caps; waits are event waits only.
-- 2026-07-07 — Worktree captured by `opsx worktree ensure deterministic-prompt-submission`: base `3fdbcd3923f54b55f7e3a5f6dce7cb20224b686f`, path `/Volumes/Workshop/git/claude-p--opsx-deterministic-prompt-submission`, integration branch `main`.
+- 2026-07-07 — Worktree captured by `opsx worktree ensure deterministic-prompt-submission`: original base `3fdbcd3923f54b55f7e3a5f6dce7cb20224b686f`, path `/Volumes/Workshop/git/claude-p--opsx-deterministic-prompt-submission`, integration branch `main`.
+- 2026-07-08 — Rebased `opsx/deterministic-prompt-submission` onto `main` HEAD `79d258e434b6a2bde9f34adf0f28b7f5a6c82c88`; post-rebase HEAD `21e4fe5d7975c23f1ad5f6751fc1256bce477918`; refreshed code-review, verify, and doneness artifacts.
 
 ## Scope Expansions
 

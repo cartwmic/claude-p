@@ -61,7 +61,6 @@ npx claude-p --model opus "explain quicksort to a 10-year-old"
 --cwd <path>
 --input-file <path>
 --verbose
---timeout <seconds>                       default: 300
 --debug
 --                                        end-of-options, remaining tokens go to PROMPT
 ```

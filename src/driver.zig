@@ -42,7 +42,6 @@ pub const Options = struct {
     mcp_ready_file: ?[]const u8 = null,
     verbose: bool = false,
     /// Wall-time cap in ms. 0 = unlimited (no cap); the cap check is skipped.
-    timeout_ms: u64 = 0,
     /// Optional write-only mirror of raw PTY output bytes. When set, every
     /// byte read from the `claude` PTY output is appended to this file in
     /// arrival order (pure tee). Strictly observational: nothing is ever
@@ -101,14 +100,11 @@ pub const RunError = error{
     TranscriptUnavailable,
     SpawnFailed,
     NoPromptSupplied,
-    // custom: the typed prompt never echoed back into Ink's input box within
-    // the bounded retype budget (input dropped by a not-yet-ready TUI). Fail
-    // fast instead of waiting --timeout for a Stop hook that can never fire.
+    // custom: positive terminal/non-acceptance evidence proved the current
+    // prompt was not accepted into the transcript. Missing echo evidence and
+    // elapsed time alone do not produce this error.
     PromptNotAccepted,
-    // custom: the MCP-readiness sentinel (Options.mcp_ready_file) never appeared
-    // within mcp_ready_max_wait_ms after the prompt echoed. We refuse to submit a
-    // prompt that would generate with NO bridged tools (the model would emit tool
-    // calls as text). Fail fast; the caller retries on a fresh spawn.
+    // custom: reserved for legacy callers; MCP readiness is now an event wait.
     McpNotReady,
     // custom: Claude Code wrote an API-error turn into the transcript and did
     // not fire Stop. Non-retryable errors and exhausted retry budgets fail fast
@@ -215,44 +211,21 @@ fn shellQuoteOne(allocator: std.mem.Allocator, out: *std.ArrayList(u8), s: []con
     try out.append(allocator, '\'');
 }
 
-/// How long the PTY output stream must be quiet before we believe Ink has
-/// finished its initial render and is ready to accept keystrokes. Smaller
-/// values type sooner; too small risks racing Ink's prompt-box draw. Tuned
-/// to 80 ms based on observed bursts (the input box renders in <50 ms of
-/// continuous output, then goes silent).
-const ink_quiescence_ms: u64 = 80;
-
-/// Upper bound on how long we'll wait for quiescence. If Ink keeps emitting
-/// output past this, we give up and type anyway; in practice the prompt box
-/// is always up by then, and the failure mode is identical to the previous
-/// fixed-sleep behavior.
-const ink_max_wait_ms: u64 = 2000;
-
 /// How long to wait between sending the prompt bytes and sending Enter.
 /// Ink's bracketed-paste heuristic merges back-to-back writes; without a
-/// gap, `\r` lands in the input buffer instead of triggering submit.
+/// gap, `\r` lands in the input buffer instead of triggering submit. This is a
+/// write-separation debounce, not a liveness timeout.
 const ink_enter_debounce_ms: u64 = 120;
 
-// --- custom (echo-confirmed input) ---
-// After typing the prompt, confirm it actually echoed into Ink's input box
-// before committing Enter, instead of trusting a blind debounce. Under
-// concurrent-boot CPU contention the SessionStart hook can fire while Ink's
-// input pipeline is not yet ready; the keystrokes are then dropped, the turn
-// never starts, and no Stop hook ever fires — the wrapper wedges until
-// --timeout. We poll the rolling `recent` PTY buffer for the prompt echo,
-// clear-line + retype on a miss, and fail fast rather than wedge.
-const echo_confirm_window_ms: u64 = 750; // per-attempt wait for the echo
-const echo_confirm_max_attempts: usize = 3;
+// PTY echo helpers remain for regression tests and diagnostics, but echo is no
+// longer the authoritative submission-acceptance gate.
 const echo_needle_max: usize = 48; // alnum chars of the prompt used as the echo needle
 
 // --- custom (MCP-readiness gate) ---
-// After the prompt echoes we HOLD the submit Enter until the MCP shim's
+// After the prompt paste completes we HOLD the submit Enter until the MCP shim's
 // readiness sentinel (Options.mcp_ready_file) appears, so the turn never
 // generates before the bridged `mcp__custom-tools__*` surface is live in
-// `claude`. `claude` requests tools/list at boot, so the shim normally raises
-// this within ~1-2s; a miss means the shim died or never attached, and we fail
-// fast (McpNotReady) rather than submit a tool-less prompt or wedge to --timeout.
-const mcp_ready_max_wait_ms: u64 = 20_000;
+// `claude`. This is an event wait, not a liveness timeout.
 
 // --- custom (API-error turn recovery) ---
 // Claude Code can flush an API-error assistant transcript record plus trailing
@@ -453,10 +426,197 @@ fn detectApiErrorTurnEndFile(allocator: std.mem.Allocator, path: []const u8, bas
     return detectApiErrorTurnEnd(allocator, bytes, baseline_turns);
 }
 
+fn isUserRecordObject(obj: std.json.ObjectMap) bool {
+    const ty = obj.get("type") orelse return false;
+    return ty == .string and std.mem.eql(u8, ty.string, "user");
+}
+
+fn userPromptId(obj: std.json.ObjectMap) ?[]const u8 {
+    const id = obj.get("promptId") orelse return null;
+    if (id != .string or id.string.len == 0) return null;
+    return id.string;
+}
+
+fn userRecordCount(allocator: std.mem.Allocator, bytes: []const u8) !u32 {
+    var count: u32 = 0;
+    var line_iter = std.mem.splitScalar(u8, bytes, '\n');
+    while (line_iter.next()) |raw_line| {
+        var line = raw_line;
+        if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
+        if (line.len == 0) continue;
+
+        var parsed = std.json.parseFromSlice(
+            std.json.Value,
+            allocator,
+            line,
+            .{ .ignore_unknown_fields = true },
+        ) catch continue;
+        defer parsed.deinit();
+
+        const root = parsed.value;
+        if (root != .object) continue;
+        if (isUserRecordObject(root.object)) count += 1;
+    }
+    return count;
+}
+
+fn clearPromptIds(allocator: std.mem.Allocator, prompt_ids: *std.StringHashMap(void)) void {
+    var key_it = prompt_ids.keyIterator();
+    while (key_it.next()) |key| allocator.free(key.*);
+    prompt_ids.clearRetainingCapacity();
+}
+
+fn collectUserPromptIds(allocator: std.mem.Allocator, bytes: []const u8, prompt_ids: *std.StringHashMap(void)) !u32 {
+    var count: u32 = 0;
+    var line_iter = std.mem.splitScalar(u8, bytes, '\n');
+    while (line_iter.next()) |raw_line| {
+        var line = raw_line;
+        if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
+        if (line.len == 0) continue;
+
+        var parsed = std.json.parseFromSlice(
+            std.json.Value,
+            allocator,
+            line,
+            .{ .ignore_unknown_fields = true },
+        ) catch continue;
+        defer parsed.deinit();
+
+        const root = parsed.value;
+        if (root != .object) continue;
+        const obj = root.object;
+        if (!isUserRecordObject(obj)) continue;
+        count += 1;
+        if (userPromptId(obj)) |pid| {
+            if (!prompt_ids.contains(pid)) {
+                const owned = try allocator.dupe(u8, pid);
+                errdefer allocator.free(owned);
+                try prompt_ids.put(owned, {});
+            }
+        }
+    }
+    return count;
+}
+
+fn hasNewUserPromptId(allocator: std.mem.Allocator, bytes: []const u8, baseline: TranscriptUserBaseline, prompt_ids: *std.StringHashMap(void)) !bool {
+    var line_iter = std.mem.splitScalar(u8, bytes, '\n');
+    while (line_iter.next()) |raw_line| {
+        var line = raw_line;
+        if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
+        if (line.len == 0) continue;
+
+        var parsed = std.json.parseFromSlice(
+            std.json.Value,
+            allocator,
+            line,
+            .{ .ignore_unknown_fields = true },
+        ) catch continue;
+        defer parsed.deinit();
+
+        const root = parsed.value;
+        if (root != .object) continue;
+        const obj = root.object;
+        if (!isUserRecordObject(obj)) continue;
+        const pid = userPromptId(obj) orelse {
+            if (baseline.allow_promptless_user) return true;
+            continue;
+        };
+        if (!prompt_ids.contains(pid)) return true;
+    }
+    return false;
+}
+
+const TranscriptUserBaseline = struct {
+    file_existed: bool = false,
+    bytes_len: u64 = 0,
+    user_records: u32 = 0,
+    allow_promptless_user: bool = false,
+};
+
+fn transcriptUserBaseline(allocator: std.mem.Allocator, bytes: []const u8, prompt_ids: *std.StringHashMap(void)) !TranscriptUserBaseline {
+    return .{
+        .file_existed = true,
+        .bytes_len = bytes.len,
+        .user_records = try collectUserPromptIds(allocator, bytes, prompt_ids),
+    };
+}
+
+fn transcriptUserBaselineFile(allocator: std.mem.Allocator, path: ?[]const u8, prompt_ids: *std.StringHashMap(void)) TranscriptUserBaseline {
+    clearPromptIds(allocator, prompt_ids);
+    const p = path orelse return .{};
+    const file = std.fs.cwd().openFile(p, .{}) catch return .{};
+    defer file.close();
+    const bytes = file.readToEndAlloc(allocator, 64 * 1024 * 1024) catch return .{};
+    defer allocator.free(bytes);
+    return transcriptUserBaseline(allocator, bytes, prompt_ids) catch .{};
+}
+
+fn transcriptHasNewUserRecord(allocator: std.mem.Allocator, path: ?[]const u8, baseline: TranscriptUserBaseline, prompt_ids: *std.StringHashMap(void)) bool {
+    const p = path orelse return false;
+    const file = std.fs.cwd().openFile(p, .{}) catch return false;
+    defer file.close();
+    const bytes = file.readToEndAlloc(allocator, 64 * 1024 * 1024) catch return false;
+    defer allocator.free(bytes);
+    return hasNewUserPromptId(allocator, bytes, baseline, prompt_ids) catch false;
+}
+
+fn captureTranscriptUserBaseline(
+    allocator: std.mem.Allocator,
+    opts: Options,
+    trace_start: i128,
+    path: ?[]const u8,
+    prompt_ids: *std.StringHashMap(void),
+) RunError!TranscriptUserBaseline {
+    var baseline = transcriptUserBaselineFile(allocator, path, prompt_ids);
+    const fresh_prompt_turn = opts.resume_session == null and !opts.cont and opts.session_id == null;
+    if (!fresh_prompt_turn and !baseline.file_existed) {
+        trace(opts, trace_start, "non-fresh transcript baseline unavailable before submit — failing closed");
+        return RunError.TranscriptUnavailable;
+    }
+    baseline.allow_promptless_user = fresh_prompt_turn and baseline.user_records == 0;
+    traceFmt(opts, trace_start, "transcript user baseline captured: existed={}, bytes={d}, user_records={d}, allow_promptless={}", .{ baseline.file_existed, baseline.bytes_len, baseline.user_records, baseline.allow_promptless_user });
+    return baseline;
+}
+
+fn waitForTranscriptUserRecord(
+    allocator: std.mem.Allocator,
+    opts: Options,
+    trace_start: i128,
+    shared: *SharedState,
+    session: anytype,
+    path: ?[]const u8,
+    baseline: TranscriptUserBaseline,
+    prompt_ids: *std.StringHashMap(void),
+) RunError!void {
+    while (true) {
+        try flushPendingToPty(allocator, shared, session);
+        if (transcriptHasNewUserRecord(allocator, path, baseline, prompt_ids)) {
+            trace(opts, trace_start, "transcript user-record acceptance confirmed");
+            return;
+        }
+        if (shared.exited.load(.seq_cst)) return RunError.PromptNotAccepted;
+        std.Thread.sleep(15 * std.time.ns_per_ms);
+    }
+}
+
 fn clearRecent(shared: *SharedState) void {
     shared.recent_mutex.lock();
     shared.recent.clearRetainingCapacity();
     shared.recent_mutex.unlock();
+}
+
+fn flushPendingToPty(allocator: std.mem.Allocator, shared: *SharedState, session: anytype) !void {
+    shared.write_mutex.lock();
+    const to_write = if (shared.pending_to_pty.items.len > 0)
+        try allocator.dupe(u8, shared.pending_to_pty.items)
+    else
+        null;
+    if (to_write != null) shared.pending_to_pty.clearRetainingCapacity();
+    shared.write_mutex.unlock();
+    if (to_write) |bytes| {
+        session.writeInput(bytes) catch {};
+        allocator.free(bytes);
+    }
 }
 
 /// True if an absolute path exists and is accessible. Used to poll for the
@@ -466,29 +626,40 @@ fn fileExists(path: []const u8) bool {
     return true;
 }
 
-/// Block until the child PTY has been quiet for at least `ink_quiescence_ms`,
-/// up to a cap of `ink_max_wait_ms`. Replaces the hardcoded "give Ink time
-/// to settle" sleep from the original fix — adapts to whatever boot latency
-/// the machine actually has.
-fn waitForInkQuiescent(opts: Options, trace_start: i128, shared: *SharedState) void {
-    const quiescence_ns: i64 = @intCast(ink_quiescence_ms * std.time.ns_per_ms);
-    const max_ns: i64 = @intCast(ink_max_wait_ms * std.time.ns_per_ms);
-    const wait_started: i64 = @intCast(std.time.nanoTimestamp());
+const bracketed_paste_enable = "\x1b[?2004h";
+const bracketed_paste_start = "\x1b[200~";
+const bracketed_paste_end = "\x1b[201~";
+
+fn inputReadyFromPty(bytes: []const u8) bool {
+    return std.mem.indexOf(u8, bytes, bracketed_paste_enable) != null;
+}
+
+/// Block until the host TUI emits the bracketed-paste-enable sentinel. This is
+/// an event wait, not a liveness timeout: the driver never "types anyway" based
+/// on elapsed time. If the child exits before readiness, surface the terminal
+/// spawn failure instead of racing a dead input surface.
+fn waitForInputReadiness(allocator: std.mem.Allocator, opts: Options, trace_start: i128, shared: *SharedState, session: anytype) RunError!void {
     while (true) {
-        const now: i64 = @intCast(std.time.nanoTimestamp());
-        if (now - wait_started > max_ns) {
-            traceFmt(opts, trace_start, "Ink readiness wait hit max ({d}ms) — typing anyway", .{ink_max_wait_ms});
+        try flushPendingToPty(allocator, shared, session);
+        if (shared.input_ready.load(.seq_cst)) {
+            trace(opts, trace_start, "input readiness confirmed (ESC[?2004h seen)");
             return;
         }
-        const last: i64 = shared.last_output_ns.load(.seq_cst);
-        if (last != 0 and now - last > quiescence_ns) {
-            const since_ms: i64 = @divTrunc(now - last, std.time.ns_per_ms);
-            const waited_ms: i64 = @divTrunc(now - wait_started, std.time.ns_per_ms);
-            traceFmt(opts, trace_start, "Ink quiescent (output silent for {d}ms, waited {d}ms total)", .{ since_ms, waited_ms });
-            return;
-        }
+        if (shared.exited.load(.seq_cst)) return RunError.SpawnFailed;
         std.Thread.sleep(15 * std.time.ns_per_ms);
     }
+}
+
+fn appendBracketedPaste(allocator: std.mem.Allocator, out: *std.ArrayList(u8), prompt: []const u8) !void {
+    try out.appendSlice(allocator, bracketed_paste_start);
+    try out.appendSlice(allocator, prompt);
+    try out.appendSlice(allocator, bracketed_paste_end);
+}
+
+fn writeBracketedPaste(session: anytype, prompt: []const u8) !void {
+    try session.writeInput(bracketed_paste_start);
+    try session.writeInput(prompt);
+    try session.writeInput(bracketed_paste_end);
 }
 
 /// Emit a debug-gated trace line to stderr with the elapsed time since
@@ -528,6 +699,7 @@ const SharedState = struct {
     /// vastly more than we need.
     last_output_ns: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
     exited: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    input_ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     // Rolling buffer of recently-seen output. The driver loop scans this
     // for the workspace-trust dialog (shown in unfamiliar directories,
     // not bypassed by --dangerously-skip-permissions) and dismisses it
@@ -573,6 +745,7 @@ fn onZmuxEvent(ctx: *anyopaque, event: zmux.native.Event) void {
         .pane_output => |po| {
             _ = shared.bytes_seen.fetchAdd(po.data.len, .seq_cst);
             mirrorChunk(shared, po.data);
+            if (inputReadyFromPty(po.data)) shared.input_ready.store(true, .seq_cst);
             shared.last_output_ns.store(@intCast(std.time.nanoTimestamp()), .seq_cst);
             // Run the DEC-query responder; queue responses for the main loop.
             var resp: std.ArrayList(u8) = .{};
@@ -587,6 +760,9 @@ fn onZmuxEvent(ctx: *anyopaque, event: zmux.native.Event) void {
             // detection in the main loop.
             shared.recent_mutex.lock();
             shared.recent.appendSlice(std.heap.page_allocator, po.data) catch {};
+            if (!shared.input_ready.load(.seq_cst) and inputReadyFromPty(shared.recent.items)) {
+                shared.input_ready.store(true, .seq_cst);
+            }
             if (shared.recent.items.len > recent_capacity) {
                 const drop = shared.recent.items.len - recent_capacity;
                 std.mem.copyForwards(
@@ -702,7 +878,6 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
     //   readiness sentinel (only entered when opts.mcp_ready_file is set)
     // awaiting_stop      → Enter sent, waiting on the Stop hook
     var state: enum { waiting_for_ready, waiting_for_mcp_ready, awaiting_stop } = .waiting_for_ready;
-    var mcp_ready_deadline_ns: i128 = 0;
     var first_emit_logged = false;
     var total_lines_streamed: usize = 0;
 
@@ -720,6 +895,13 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
     // count past this; until it does, any Stop/parse reflects a REPLAYED prior
     // turn (the `--resume` stale-result race). Captured at echo-confirm, below.
     var baseline_turns: u32 = 0;
+    // Prompt-acceptance baseline: the number of user records already in the
+    // transcript BEFORE the live prompt is submitted. The live prompt is
+    // accepted only when the active transcript gains another user record.
+    var baseline_user_record: TranscriptUserBaseline = .{};
+    var baseline_user_prompt_ids = std.StringHashMap(void).init(allocator);
+    defer baseline_user_prompt_ids.deinit();
+    defer clearPromptIds(allocator, &baseline_user_prompt_ids);
     // Resume BILLING baseline: the deduped usage already in the transcript before
     // submit. The final result's usage is the post-turn deduped total MINUS this,
     // so result.usage reflects only the live turn (mirroring `claude -p`, which
@@ -745,48 +927,30 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
     var api_error_retries_done: u32 = 0;
 
     while (true) {
-        const now: i128 = std.time.nanoTimestamp();
-        const elapsed_ms: u64 = @intCast(@divTrunc(now - start_ns, std.time.ns_per_ms));
-        if (opts.timeout_ms != 0 and elapsed_ms > opts.timeout_ms) {
-            if (state == .waiting_for_ready) return RunError.SessionStartTimeout;
-            if (state == .waiting_for_mcp_ready) return RunError.McpNotReady;
-            return RunError.StopTimeout;
-        }
         if (shared.exited.load(.seq_cst) and
             (state == .waiting_for_ready or state == .waiting_for_mcp_ready))
         {
             return RunError.SpawnFailed;
         }
 
-        // MCP-readiness gate: the prompt is typed and echoed; we hold the submit
-        // Enter here (the main loop keeps servicing the PTY) until the shim's
-        // sentinel appears, then submit. Fail fast if it never shows.
+        // MCP-readiness gate: the prompt paste has completed; we hold submit
+        // Enter until the shim's sentinel appears. This is an event wait (like
+        // the readiness and transcript gates), not a liveness timeout.
         if (state == .waiting_for_mcp_ready) {
             if (opts.mcp_ready_file) |rf| {
                 if (fileExists(rf)) {
                     std.Thread.sleep(ink_enter_debounce_ms * std.time.ns_per_ms);
                     session.send("", true) catch {};
-                    trace(opts, trace_start, "MCP surface ready; Enter sent; waiting on claude API");
+                    trace(opts, trace_start, "MCP surface ready; Enter sent; waiting for transcript user-record acceptance");
+                    try waitForTranscriptUserRecord(allocator, opts, trace_start, &shared, session, transcript_path, baseline_user_record, &baseline_user_prompt_ids);
+                    trace(opts, trace_start, "transcript accepted prompt; waiting on claude API");
                     state = .awaiting_stop;
-                } else if (now > mcp_ready_deadline_ns) {
-                    traceFmt(opts, trace_start, "MCP readiness sentinel never appeared within {d}ms — failing fast (McpNotReady)", .{mcp_ready_max_wait_ms});
-                    return RunError.McpNotReady;
                 }
             }
         }
 
         // Flush any DEC-responder bytes back to the PTY.
-        shared.write_mutex.lock();
-        const to_write = if (shared.pending_to_pty.items.len > 0)
-            try allocator.dupe(u8, shared.pending_to_pty.items)
-        else
-            null;
-        if (to_write != null) shared.pending_to_pty.clearRetainingCapacity();
-        shared.write_mutex.unlock();
-        if (to_write) |bytes| {
-            session.writeInput(bytes) catch {};
-            allocator.free(bytes);
-        }
+        try flushPendingToPty(allocator, &shared, session);
 
         // Workspace-trust dialog detection. Claude shows a "Is this a project
         // you trust?" prompt in unfamiliar directories that blocks startup
@@ -837,82 +1001,34 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
                                 }
                             }
                             if (state == .waiting_for_ready) {
-                                // Wait for Ink to finish its initial render
-                                // before sending keystrokes. Signal: the PTY
-                                // output stream has been quiet for the
-                                // quiescence threshold below. Adaptive —
-                                // fast machines proceed in <100 ms, slow
-                                // ones get up to ink_max_wait_ms before we
-                                // give up and type anyway.
-                                waitForInkQuiescent(opts, trace_start, &shared);
+                                // Wait for the host input surface itself, not
+                                // a quiescence timer. `ESC[?2004h` means Claude
+                                // Code has enabled bracketed paste for the live
+                                // prompt box; until then, prompt bytes can be
+                                // dropped by the not-yet-ready TUI.
+                                try waitForInputReadiness(allocator, opts, trace_start, &shared, session);
 
-                                // custom (echo-confirmed input): type the
-                                // prompt, then CONFIRM it echoed into Ink's
-                                // input box before committing Enter. Prompt and
-                                // `\r` are still sent as two events (Ink's
-                                // bracketed-paste heuristic merges back-to-back
-                                // writes, so a same-burst `\r` would land in the
-                                // buffer instead of submitting). Under
-                                // concurrent-boot contention the keystrokes can
-                                // be dropped by a not-yet-ready TUI; retype
-                                // (clear-line first, so a partial can't
-                                // concatenate) up to echo_confirm_max_attempts,
-                                // then fail fast rather than wedge until
-                                // --timeout for a Stop that can never come.
-                                var attempt: usize = 0;
-                                var confirmed = false;
-                                while (attempt < echo_confirm_max_attempts and !confirmed) : (attempt += 1) {
-                                    if (attempt > 0) {
-                                        // Ctrl-U kills the input line so a
-                                        // partially-accepted prior attempt
-                                        // cannot concatenate into a corrupt prompt.
-                                        session.send("\x15", false) catch {};
-                                        std.Thread.sleep(40 * std.time.ns_per_ms);
-                                    }
-                                    traceFmt(opts, trace_start, "typing prompt ({d} bytes), attempt {d}", .{ opts.prompt.len, attempt + 1 });
-                                    session.send(opts.prompt, false) catch {};
+                                traceFmt(opts, trace_start, "pasting prompt ({d} bytes)", .{opts.prompt.len});
+                                writeBracketedPaste(session, opts.prompt) catch {};
 
-                                    const echo_window_ns: i64 = @intCast(echo_confirm_window_ms * std.time.ns_per_ms);
-                                    const echo_wait_start: i64 = @intCast(std.time.nanoTimestamp());
-                                    while (true) {
-                                        if (promptEchoConfirmed(allocator, &shared, opts.prompt) catch false) {
-                                            confirmed = true;
-                                            break;
-                                        }
-                                        const echo_now: i64 = @intCast(std.time.nanoTimestamp());
-                                        if (echo_now - echo_wait_start > echo_window_ns) break;
-                                        std.Thread.sleep(25 * std.time.ns_per_ms);
-                                    }
-                                }
-
-                                if (!confirmed) {
-                                    traceFmt(opts, trace_start, "prompt echo never confirmed after {d} attempt(s) — failing fast (PromptNotAccepted)", .{echo_confirm_max_attempts});
-                                    return RunError.PromptNotAccepted;
-                                }
-
-                                // Resume-staleness guard: snapshot how many assistant
-                                // turns the transcript already has BEFORE submit. The
-                                // prompt is echoed into Ink's input box but NOT yet
-                                // committed, so the transcript still ends at the prior
-                                // turn. The live turn must push this count higher
-                                // before its result is trusted (driver post-Stop loop).
+                                // Snapshot baselines after paste delivery but before
+                                // submit Enter. The transcript still ends at the prior
+                                // turn; the live prompt must create a new user record
+                                // before any assistant Stop/result is trusted.
                                 baseline_turns = transcript_mod.turnCountFile(allocator, transcript_path);
+                                baseline_user_record = try captureTranscriptUserBaseline(allocator, opts, trace_start, transcript_path, &baseline_user_prompt_ids);
                                 baseline_usage = transcript_mod.usageFile(allocator, transcript_path);
-                                traceFmt(opts, trace_start, "resume-staleness baseline = {d} assistant turn(s) before submit", .{baseline_turns});
+                                traceFmt(opts, trace_start, "submit baselines before Enter: assistant_turns={d}, user_records={d}, bytes={d}", .{ baseline_turns, baseline_user_record.user_records, baseline_user_record.bytes_len });
 
-                                // The prompt is in Ink's input box but NOT yet
-                                // submitted. When an MCP-readiness sentinel was
-                                // requested, hold the Enter until the bridged tool
-                                // surface is live (the main loop polls the file and
-                                // submits); otherwise submit immediately (legacy).
                                 if (opts.mcp_ready_file) |rf| {
-                                    mcp_ready_deadline_ns = std.time.nanoTimestamp() + @as(i128, @intCast(mcp_ready_max_wait_ms)) * std.time.ns_per_ms;
-                                    traceFmt(opts, trace_start, "prompt echo confirmed; holding Enter for MCP readiness (file={s})", .{rf});
+                                    traceFmt(opts, trace_start, "prompt pasted; holding Enter for MCP readiness (file={s})", .{rf});
                                     state = .waiting_for_mcp_ready;
                                 } else {
                                     std.Thread.sleep(ink_enter_debounce_ms * std.time.ns_per_ms);
                                     session.send("", true) catch {};
-                                    trace(opts, trace_start, "prompt echo confirmed; Enter sent; waiting on claude API");
+                                    trace(opts, trace_start, "Enter sent; waiting for transcript user-record acceptance");
+                                    try waitForTranscriptUserRecord(allocator, opts, trace_start, &shared, session, transcript_path, baseline_user_record, &baseline_user_prompt_ids);
+                                    trace(opts, trace_start, "transcript accepted prompt; waiting on claude API");
                                     state = .awaiting_stop;
                                 }
                             }
@@ -1005,42 +1121,18 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
                         std.Thread.sleep(backoff_ms * std.time.ns_per_ms);
 
                         baseline_turns = transcript_mod.turnCountFile(allocator, transcript_path);
+                        baseline_user_record = try captureTranscriptUserBaseline(allocator, opts, trace_start, transcript_path, &baseline_user_prompt_ids);
                         baseline_usage = transcript_mod.usageFile(allocator, transcript_path);
-                        traceFmt(opts, trace_start, "resume-staleness baseline reset after API error = {d} assistant turn(s)", .{baseline_turns});
+                        traceFmt(opts, trace_start, "submit baselines reset after API error: assistant_turns={d}, user_records={d}, bytes={d}", .{ baseline_turns, baseline_user_record.user_records, baseline_user_record.bytes_len });
 
-                        clearRecent(&shared);
-                        var attempt: usize = 0;
-                        var confirmed = false;
-                        while (attempt < echo_confirm_max_attempts and !confirmed) : (attempt += 1) {
-                            if (attempt > 0) {
-                                session.send("\x15", false) catch {};
-                                std.Thread.sleep(40 * std.time.ns_per_ms);
-                                clearRecent(&shared);
-                            }
-                            traceFmt(opts, trace_start, "retyping prompt after API error ({d} bytes), attempt {d}", .{ opts.prompt.len, attempt + 1 });
-                            session.send(opts.prompt, false) catch {};
-
-                            const echo_window_ns: i64 = @intCast(echo_confirm_window_ms * std.time.ns_per_ms);
-                            const echo_wait_start: i64 = @intCast(std.time.nanoTimestamp());
-                            while (true) {
-                                if (promptEchoConfirmed(allocator, &shared, opts.prompt) catch false) {
-                                    confirmed = true;
-                                    break;
-                                }
-                                const echo_now: i64 = @intCast(std.time.nanoTimestamp());
-                                if (echo_now - echo_wait_start > echo_window_ns) break;
-                                std.Thread.sleep(25 * std.time.ns_per_ms);
-                            }
-                        }
-
-                        if (!confirmed) {
-                            traceFmt(opts, trace_start, "retry prompt echo never confirmed after {d} attempt(s) — failing fast (PromptNotAccepted)", .{echo_confirm_max_attempts});
-                            return RunError.PromptNotAccepted;
-                        }
+                        traceFmt(opts, trace_start, "repasting prompt after API error ({d} bytes)", .{opts.prompt.len});
+                        writeBracketedPaste(session, opts.prompt) catch {};
 
                         std.Thread.sleep(ink_enter_debounce_ms * std.time.ns_per_ms);
                         session.send("", true) catch {};
-                        trace(opts, trace_start, "retry prompt echo confirmed; Enter sent; waiting on claude API");
+                        trace(opts, trace_start, "retry Enter sent; waiting for transcript user-record acceptance");
+                        try waitForTranscriptUserRecord(allocator, opts, trace_start, &shared, session, transcript_path, baseline_user_record, &baseline_user_prompt_ids);
+                        trace(opts, trace_start, "transcript accepted retry prompt; waiting on claude API");
                     } else {
                         setLastApiErrorMessage(failed_attempts, turn.text);
                         traceFmt(opts, trace_start, "API-error turn failed fast: {s}", .{lastApiErrorMessage()});
@@ -1273,6 +1365,145 @@ fn promptEchoConfirmed(allocator: std.mem.Allocator, shared: *SharedState, promp
 // -------- tests --------
 
 const testing = std.testing;
+
+test "input readiness requires bracketed-paste enable sentinel" {
+    // AC: prompt-echo-confirmation.prompt-delivery-readiness-is-event-gated
+    try testing.expect(!inputReadyFromPty("booting..."));
+    try testing.expect(!inputReadyFromPty("\x1b[?20"));
+    try testing.expect(inputReadyFromPty("booting...\x1b[?2004hready"));
+    try testing.expect(inputReadyFromPty("\x1b[?20" ++ "04h"));
+}
+
+test "appendBracketedPaste frames prompt before separate Enter" {
+    // AC: prompt-echo-confirmation.prompt-delivery-uses-bracketed-paste
+    var out: std.ArrayList(u8) = .{};
+    defer out.deinit(testing.allocator);
+    try appendBracketedPaste(testing.allocator, &out, "hello\nworld");
+    try testing.expectEqualStrings("\x1b[200~hello\nworld\x1b[201~", out.items);
+    try testing.expect(std.mem.indexOf(u8, out.items, "\r") == null);
+}
+
+test "non-fresh missing transcript baseline fails closed" {
+    // AC: prompt-echo-confirmation.replayed-history-does-not-confirm-submission
+    var prompt_ids = std.StringHashMap(void).init(testing.allocator);
+    defer prompt_ids.deinit();
+    defer clearPromptIds(testing.allocator, &prompt_ids);
+    try testing.expectError(
+        RunError.TranscriptUnavailable,
+        captureTranscriptUserBaseline(
+            testing.allocator,
+            .{ .prompt = "x", .resume_session = "sid" },
+            0,
+            null,
+            &prompt_ids,
+        ),
+    );
+}
+
+test "missing transcript baseline does not block fresh-session acceptance" {
+    // AC: prompt-echo-confirmation.transcript-user-record-confirms-submission
+    const baseline: TranscriptUserBaseline = .{ .allow_promptless_user = true };
+    try testing.expect(!baseline.file_existed);
+    const first_write =
+        \\{"type":"user","sessionId":"s","message":{"content":[{"type":"text","text":"fresh"}]}}
+        \\
+    ;
+    try testing.expect((try userRecordCount(testing.allocator, first_write[baseline.bytes_len..])) > 0);
+}
+
+test "transcript baseline accepts only user records after baseline offset" {
+    // AC: prompt-echo-confirmation.transcript-user-record-confirms-submission
+    const before =
+        \\{"promptId":"p1","type":"user","sessionId":"s","message":{"content":[{"type":"text","text":"prior"}]}}
+        \\{"type":"assistant","sessionId":"s","message":{"content":[{"type":"text","text":"old"}]}}
+        \\
+    ;
+    const after =
+        \\{"promptId":"p1","type":"user","sessionId":"s","message":{"content":[{"type":"text","text":"prior"}]}}
+        \\{"type":"assistant","sessionId":"s","message":{"content":[{"type":"text","text":"old"}]}}
+        \\{"promptId":"p2","type":"user","sessionId":"s","message":{"content":[{"type":"text","text":"live"}]}}
+        \\
+    ;
+    var prompt_ids = std.StringHashMap(void).init(testing.allocator);
+    defer prompt_ids.deinit();
+    defer clearPromptIds(testing.allocator, &prompt_ids);
+    const baseline = try transcriptUserBaseline(testing.allocator, before, &prompt_ids);
+    try testing.expectEqual(@as(u32, 1), baseline.user_records);
+    try testing.expect(prompt_ids.contains("p1"));
+    try testing.expectEqual(@as(u64, before.len), baseline.bytes_len);
+    try testing.expectEqual(baseline.user_records, try userRecordCount(testing.allocator, after[0..baseline.bytes_len]));
+    try testing.expect(try hasNewUserPromptId(testing.allocator, after[baseline.bytes_len..], baseline, &prompt_ids));
+}
+
+test "promptId-less user record is ignored unless fresh promptless acceptance is allowed" {
+    // AC: prompt-echo-confirmation.replayed-history-does-not-confirm-submission
+    const promptless =
+        \\{"type":"user","sessionId":"s","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}
+        \\
+    ;
+    var prompt_ids = std.StringHashMap(void).init(testing.allocator);
+    defer prompt_ids.deinit();
+    defer clearPromptIds(testing.allocator, &prompt_ids);
+    try testing.expect(!(try hasNewUserPromptId(testing.allocator, promptless, .{}, &prompt_ids)));
+    try testing.expect(try hasNewUserPromptId(testing.allocator, promptless, .{ .allow_promptless_user = true }, &prompt_ids));
+}
+
+test "promptId-less warm-resume tool result does not hide later live prompt" {
+    // AC: prompt-echo-confirmation.transcript-user-record-confirms-submission
+    const before =
+        \\{"promptId":"p1","type":"user","sessionId":"s","message":{"content":[{"type":"text","text":"prior"}]}}
+        \\{"type":"assistant","sessionId":"s","message":{"content":[{"type":"tool_use","id":"t1","name":"x"}]}}
+        \\
+    ;
+    const after = before ++
+        \\{"type":"user","sessionId":"s","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}
+        \\{"promptId":"p2","type":"user","sessionId":"s","message":{"content":[{"type":"text","text":"live"}]}}
+        \\
+    ;
+    var prompt_ids = std.StringHashMap(void).init(testing.allocator);
+    defer prompt_ids.deinit();
+    defer clearPromptIds(testing.allocator, &prompt_ids);
+    const baseline = try transcriptUserBaseline(testing.allocator, before, &prompt_ids);
+    try testing.expect(!baseline.allow_promptless_user);
+    try testing.expect(try hasNewUserPromptId(testing.allocator, after, baseline, &prompt_ids));
+}
+
+test "replayed echo or paste marker does not confirm without transcript user record" {
+    // AC: prompt-echo-confirmation.replayed-history-does-not-confirm-submission
+    const replayed_pty = "what is 2+2? [Pasted\x1b[11Gtext\x1b[16G#1] paste again to expand";
+    const stripped = try stripCsi(testing.allocator, replayed_pty);
+    defer testing.allocator.free(stripped);
+    const hay = try alnumCopy(testing.allocator, stripped);
+    defer testing.allocator.free(hay);
+    try testing.expect(echoConfirms(hay, "WHATIS22", stripped));
+
+    const transcript =
+        \\{"promptId":"same","type":"user","sessionId":"s","message":{"content":[{"type":"text","text":"what is 2+2?"}]}}
+        \\{"type":"assistant","sessionId":"s","message":{"content":[{"type":"text","text":"4"}]}}
+        \\
+    ;
+    var prompt_ids = std.StringHashMap(void).init(testing.allocator);
+    defer prompt_ids.deinit();
+    defer clearPromptIds(testing.allocator, &prompt_ids);
+    const baseline = try transcriptUserBaseline(testing.allocator, transcript, &prompt_ids);
+    try testing.expectEqual(@as(u32, 1), baseline.user_records);
+    try testing.expect(!try hasNewUserPromptId(testing.allocator, transcript, baseline, &prompt_ids));
+}
+
+test "submission acceptance has no elapsed-time or echo-window failure path" {
+    // AC: prompt-echo-confirmation.submission-handshake-has-no-liveness-timeout
+    // AC: prompt-echo-confirmation.prompt-not-accepted-is-positive-signal-only
+    const source = try std.fs.cwd().readFileAlloc(testing.allocator, "src/driver.zig", 1024 * 1024);
+    defer testing.allocator.free(source);
+    const stale_echo_clock = "echo_wait" ++ "_start";
+    const stale_echo_failure = "prompt echo" ++ " never confirmed";
+    const stale_mcp_deadline = "mcp_ready" ++ "_deadline";
+    const stale_type_anyway = "typing" ++ " anyway";
+    try testing.expect(std.mem.indexOf(u8, source, stale_echo_clock) == null);
+    try testing.expect(std.mem.indexOf(u8, source, stale_echo_failure) == null);
+    try testing.expect(std.mem.indexOf(u8, source, stale_mcp_deadline) == null);
+    try testing.expect(std.mem.indexOf(u8, source, stale_type_anyway) == null);
+}
 
 test "api error detector: overloaded turn after baseline is terminal and retryable" {
     // AC: api-error-turns.transcript-api-error-ends-turn
