@@ -453,6 +453,43 @@ fn detectApiErrorTurnEndFile(allocator: std.mem.Allocator, path: []const u8, bas
     return detectApiErrorTurnEnd(allocator, bytes, baseline_turns);
 }
 
+fn userRecordCount(allocator: std.mem.Allocator, bytes: []const u8) !u32 {
+    var count: u32 = 0;
+    var line_iter = std.mem.splitScalar(u8, bytes, '\n');
+    while (line_iter.next()) |raw_line| {
+        var line = raw_line;
+        if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
+        if (line.len == 0) continue;
+
+        var parsed = std.json.parseFromSlice(
+            std.json.Value,
+            allocator,
+            line,
+            .{ .ignore_unknown_fields = true },
+        ) catch continue;
+        defer parsed.deinit();
+
+        const root = parsed.value;
+        if (root != .object) continue;
+        const ty = root.object.get("type") orelse continue;
+        if (ty == .string and std.mem.eql(u8, ty.string, "user")) count += 1;
+    }
+    return count;
+}
+
+fn userRecordCountFile(allocator: std.mem.Allocator, path: ?[]const u8) u32 {
+    const p = path orelse return 0;
+    const file = std.fs.cwd().openFile(p, .{}) catch return 0;
+    defer file.close();
+    const bytes = file.readToEndAlloc(allocator, 64 * 1024 * 1024) catch return 0;
+    defer allocator.free(bytes);
+    return userRecordCount(allocator, bytes) catch 0;
+}
+
+fn transcriptHasNewUserRecord(allocator: std.mem.Allocator, path: ?[]const u8, baseline_user_records: u32) bool {
+    return userRecordCountFile(allocator, path) > baseline_user_records;
+}
+
 fn clearRecent(shared: *SharedState) void {
     shared.recent_mutex.lock();
     shared.recent.clearRetainingCapacity();
@@ -733,6 +770,10 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
     // count past this; until it does, any Stop/parse reflects a REPLAYED prior
     // turn (the `--resume` stale-result race). Captured at echo-confirm, below.
     var baseline_turns: u32 = 0;
+    // Prompt-acceptance baseline: the number of user records already in the
+    // transcript BEFORE the live prompt is submitted. The live prompt is
+    // accepted only when the active transcript gains another user record.
+    var baseline_user_records: u32 = 0;
     // Resume BILLING baseline: the deduped usage already in the transcript before
     // submit. The final result's usage is the post-turn deduped total MINUS this,
     // so result.usage reflects only the live turn (mirroring `claude -p`, which
@@ -908,8 +949,9 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
                                 // turn. The live turn must push this count higher
                                 // before its result is trusted (driver post-Stop loop).
                                 baseline_turns = transcript_mod.turnCountFile(allocator, transcript_path);
+                                baseline_user_records = userRecordCountFile(allocator, transcript_path);
                                 baseline_usage = transcript_mod.usageFile(allocator, transcript_path);
-                                traceFmt(opts, trace_start, "resume-staleness baseline = {d} assistant turn(s) before submit", .{baseline_turns});
+                                traceFmt(opts, trace_start, "submit baselines before Enter: assistant_turns={d}, user_records={d}", .{ baseline_turns, baseline_user_records });
 
                                 // The prompt is in Ink's input box but NOT yet
                                 // submitted. When an MCP-readiness sentinel was
@@ -1016,8 +1058,9 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
                         std.Thread.sleep(backoff_ms * std.time.ns_per_ms);
 
                         baseline_turns = transcript_mod.turnCountFile(allocator, transcript_path);
+                        baseline_user_records = userRecordCountFile(allocator, transcript_path);
                         baseline_usage = transcript_mod.usageFile(allocator, transcript_path);
-                        traceFmt(opts, trace_start, "resume-staleness baseline reset after API error = {d} assistant turn(s)", .{baseline_turns});
+                        traceFmt(opts, trace_start, "submit baselines reset after API error: assistant_turns={d}, user_records={d}", .{ baseline_turns, baseline_user_records });
 
                         clearRecent(&shared);
                         var attempt: usize = 0;

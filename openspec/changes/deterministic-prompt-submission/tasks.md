@@ -28,7 +28,7 @@
   - files_allowed:
       - src/driver.zig
   - allow_new_files: false
-- [ ] 2.3 Add transcript user-record baseline and acceptance detection for the active Claude Code session, using the transcript path already available to the driver.
+- [x] 2.3 Add transcript user-record baseline and acceptance detection for the active Claude Code session, using the transcript path already available to the driver.
   - intent: fix
   - files_allowed:
       - src/driver.zig
