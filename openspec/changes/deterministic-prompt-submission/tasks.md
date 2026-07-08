@@ -10,7 +10,7 @@
   - files_allowed:
       - openspec/domain.md
   - allow_new_files: false
-- [ ] 1.3 Keep the live `prompt-echo-confirmation` spec consistent with the delta requirements during archive/apply validation.
+- [x] 1.3 Keep the live `prompt-echo-confirmation` spec consistent with the delta requirements during archive/apply validation.
   - intent: feature
   - files_allowed:
       - openspec/specs/prompt-echo-confirmation/spec.md
