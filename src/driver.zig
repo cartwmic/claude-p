@@ -42,7 +42,6 @@ pub const Options = struct {
     mcp_ready_file: ?[]const u8 = null,
     verbose: bool = false,
     /// Wall-time cap in ms. 0 = unlimited (no cap); the cap check is skipped.
-    timeout_ms: u64 = 0,
     /// Optional write-only mirror of raw PTY output bytes. When set, every
     /// byte read from the `claude` PTY output is appended to this file in
     /// arrival order (pure tee). Strictly observational: nothing is ever
@@ -105,9 +104,7 @@ pub const RunError = error{
     // prompt was not accepted into the transcript. Missing echo evidence and
     // elapsed time alone do not produce this error.
     PromptNotAccepted,
-    // custom: opt-in --timeout/CLAUDE_P_TIMEOUT_SECONDS expired while holding
-    // for MCP readiness. With the default unlimited timeout, MCP readiness is an
-    // event wait like input readiness and transcript acceptance.
+    // custom: reserved for legacy callers; MCP readiness is now an event wait.
     McpNotReady,
     // custom: Claude Code wrote an API-error turn into the transcript and did
     // not fire Stop. Non-retryable errors and exhausted retry budgets fail fast
@@ -453,17 +450,53 @@ fn userRecordCount(allocator: std.mem.Allocator, bytes: []const u8) !u32 {
     return count;
 }
 
-fn userRecordCountFile(allocator: std.mem.Allocator, path: ?[]const u8) u32 {
-    const p = path orelse return 0;
-    const file = std.fs.cwd().openFile(p, .{}) catch return 0;
-    defer file.close();
-    const bytes = file.readToEndAlloc(allocator, 64 * 1024 * 1024) catch return 0;
-    defer allocator.free(bytes);
-    return userRecordCount(allocator, bytes) catch 0;
+const TranscriptUserBaseline = struct {
+    bytes_len: u64 = 0,
+    user_records: u32 = 0,
+};
+
+fn transcriptUserBaseline(allocator: std.mem.Allocator, bytes: []const u8) !TranscriptUserBaseline {
+    return .{
+        .bytes_len = bytes.len,
+        .user_records = try userRecordCount(allocator, bytes),
+    };
 }
 
-fn transcriptHasNewUserRecord(allocator: std.mem.Allocator, path: ?[]const u8, baseline_user_records: u32) bool {
-    return userRecordCountFile(allocator, path) > baseline_user_records;
+fn transcriptUserBaselineFile(allocator: std.mem.Allocator, path: ?[]const u8) ?TranscriptUserBaseline {
+    const p = path orelse return null;
+    const file = std.fs.cwd().openFile(p, .{}) catch return null;
+    defer file.close();
+    const bytes = file.readToEndAlloc(allocator, 64 * 1024 * 1024) catch return null;
+    defer allocator.free(bytes);
+    return transcriptUserBaseline(allocator, bytes) catch null;
+}
+
+fn transcriptHasNewUserRecord(allocator: std.mem.Allocator, path: ?[]const u8, baseline: TranscriptUserBaseline) bool {
+    const p = path orelse return false;
+    const file = std.fs.cwd().openFile(p, .{}) catch return false;
+    defer file.close();
+    const bytes = file.readToEndAlloc(allocator, 64 * 1024 * 1024) catch return false;
+    defer allocator.free(bytes);
+    if (bytes.len <= baseline.bytes_len) return false;
+    const start: usize = @intCast(baseline.bytes_len);
+    return (userRecordCount(allocator, bytes[start..]) catch 0) > 0;
+}
+
+fn waitForTranscriptUserBaseline(
+    allocator: std.mem.Allocator,
+    opts: Options,
+    trace_start: i128,
+    shared: *SharedState,
+    path: ?[]const u8,
+) RunError!TranscriptUserBaseline {
+    while (true) {
+        if (transcriptUserBaselineFile(allocator, path)) |baseline| {
+            traceFmt(opts, trace_start, "transcript user baseline captured: bytes={d}, user_records={d}", .{ baseline.bytes_len, baseline.user_records });
+            return baseline;
+        }
+        if (shared.exited.load(.seq_cst)) return RunError.TranscriptUnavailable;
+        std.Thread.sleep(15 * std.time.ns_per_ms);
+    }
 }
 
 fn waitForTranscriptUserRecord(
@@ -472,10 +505,10 @@ fn waitForTranscriptUserRecord(
     trace_start: i128,
     shared: *SharedState,
     path: ?[]const u8,
-    baseline_user_records: u32,
+    baseline: TranscriptUserBaseline,
 ) RunError!void {
     while (true) {
-        if (transcriptHasNewUserRecord(allocator, path, baseline_user_records)) {
+        if (transcriptHasNewUserRecord(allocator, path, baseline)) {
             trace(opts, trace_start, "transcript user-record acceptance confirmed");
             return;
         }
@@ -511,10 +544,7 @@ fn inputReadyFromPty(bytes: []const u8) bool {
 /// spawn failure instead of racing a dead input surface.
 fn waitForInputReadiness(opts: Options, trace_start: i128, shared: *SharedState) RunError!void {
     while (true) {
-        shared.recent_mutex.lock();
-        const ready = inputReadyFromPty(shared.recent.items);
-        shared.recent_mutex.unlock();
-        if (ready) {
+        if (shared.input_ready.load(.seq_cst)) {
             trace(opts, trace_start, "input readiness confirmed (ESC[?2004h seen)");
             return;
         }
@@ -572,6 +602,7 @@ const SharedState = struct {
     /// vastly more than we need.
     last_output_ns: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
     exited: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    input_ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     // Rolling buffer of recently-seen output. The driver loop scans this
     // for the workspace-trust dialog (shown in unfamiliar directories,
     // not bypassed by --dangerously-skip-permissions) and dismisses it
@@ -617,6 +648,7 @@ fn onZmuxEvent(ctx: *anyopaque, event: zmux.native.Event) void {
         .pane_output => |po| {
             _ = shared.bytes_seen.fetchAdd(po.data.len, .seq_cst);
             mirrorChunk(shared, po.data);
+            if (inputReadyFromPty(po.data)) shared.input_ready.store(true, .seq_cst);
             shared.last_output_ns.store(@intCast(std.time.nanoTimestamp()), .seq_cst);
             // Run the DEC-query responder; queue responses for the main loop.
             var resp: std.ArrayList(u8) = .{};
@@ -766,7 +798,7 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
     // Prompt-acceptance baseline: the number of user records already in the
     // transcript BEFORE the live prompt is submitted. The live prompt is
     // accepted only when the active transcript gains another user record.
-    var baseline_user_records: u32 = 0;
+    var baseline_user_record: TranscriptUserBaseline = .{};
     // Resume BILLING baseline: the deduped usage already in the transcript before
     // submit. The final result's usage is the post-turn deduped total MINUS this,
     // so result.usage reflects only the live turn (mirroring `claude -p`, which
@@ -792,13 +824,6 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
     var api_error_retries_done: u32 = 0;
 
     while (true) {
-        const now: i128 = std.time.nanoTimestamp();
-        const elapsed_ms: u64 = @intCast(@divTrunc(now - start_ns, std.time.ns_per_ms));
-        if (opts.timeout_ms != 0 and elapsed_ms > opts.timeout_ms) {
-            if (state == .waiting_for_ready) return RunError.SessionStartTimeout;
-            if (state == .waiting_for_mcp_ready) return RunError.McpNotReady;
-            return RunError.StopTimeout;
-        }
         if (shared.exited.load(.seq_cst) and
             (state == .waiting_for_ready or state == .waiting_for_mcp_ready))
         {
@@ -814,7 +839,7 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
                     std.Thread.sleep(ink_enter_debounce_ms * std.time.ns_per_ms);
                     session.send("", true) catch {};
                     trace(opts, trace_start, "MCP surface ready; Enter sent; waiting for transcript user-record acceptance");
-                    try waitForTranscriptUserRecord(allocator, opts, trace_start, &shared, transcript_path, baseline_user_records);
+                    try waitForTranscriptUserRecord(allocator, opts, trace_start, &shared, transcript_path, baseline_user_record);
                     trace(opts, trace_start, "transcript accepted prompt; waiting on claude API");
                     state = .awaiting_stop;
                 }
@@ -898,9 +923,9 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
                                 // turn; the live prompt must create a new user record
                                 // before any assistant Stop/result is trusted.
                                 baseline_turns = transcript_mod.turnCountFile(allocator, transcript_path);
-                                baseline_user_records = userRecordCountFile(allocator, transcript_path);
+                                baseline_user_record = try waitForTranscriptUserBaseline(allocator, opts, trace_start, &shared, transcript_path);
                                 baseline_usage = transcript_mod.usageFile(allocator, transcript_path);
-                                traceFmt(opts, trace_start, "submit baselines before Enter: assistant_turns={d}, user_records={d}", .{ baseline_turns, baseline_user_records });
+                                traceFmt(opts, trace_start, "submit baselines before Enter: assistant_turns={d}, user_records={d}, bytes={d}", .{ baseline_turns, baseline_user_record.user_records, baseline_user_record.bytes_len });
 
                                 if (opts.mcp_ready_file) |rf| {
                                     traceFmt(opts, trace_start, "prompt pasted; holding Enter for MCP readiness (file={s})", .{rf});
@@ -909,7 +934,7 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
                                     std.Thread.sleep(ink_enter_debounce_ms * std.time.ns_per_ms);
                                     session.send("", true) catch {};
                                     trace(opts, trace_start, "Enter sent; waiting for transcript user-record acceptance");
-                                    try waitForTranscriptUserRecord(allocator, opts, trace_start, &shared, transcript_path, baseline_user_records);
+                                    try waitForTranscriptUserRecord(allocator, opts, trace_start, &shared, transcript_path, baseline_user_record);
                                     trace(opts, trace_start, "transcript accepted prompt; waiting on claude API");
                                     state = .awaiting_stop;
                                 }
@@ -1003,9 +1028,9 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
                         std.Thread.sleep(backoff_ms * std.time.ns_per_ms);
 
                         baseline_turns = transcript_mod.turnCountFile(allocator, transcript_path);
-                        baseline_user_records = userRecordCountFile(allocator, transcript_path);
+                        baseline_user_record = try waitForTranscriptUserBaseline(allocator, opts, trace_start, &shared, transcript_path);
                         baseline_usage = transcript_mod.usageFile(allocator, transcript_path);
-                        traceFmt(opts, trace_start, "submit baselines reset after API error: assistant_turns={d}, user_records={d}", .{ baseline_turns, baseline_user_records });
+                        traceFmt(opts, trace_start, "submit baselines reset after API error: assistant_turns={d}, user_records={d}, bytes={d}", .{ baseline_turns, baseline_user_record.user_records, baseline_user_record.bytes_len });
 
                         traceFmt(opts, trace_start, "repasting prompt after API error ({d} bytes)", .{opts.prompt.len});
                         writeBracketedPaste(session, opts.prompt) catch {};
@@ -1013,7 +1038,7 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
                         std.Thread.sleep(ink_enter_debounce_ms * std.time.ns_per_ms);
                         session.send("", true) catch {};
                         trace(opts, trace_start, "retry Enter sent; waiting for transcript user-record acceptance");
-                        try waitForTranscriptUserRecord(allocator, opts, trace_start, &shared, transcript_path, baseline_user_records);
+                        try waitForTranscriptUserRecord(allocator, opts, trace_start, &shared, transcript_path, baseline_user_record);
                         trace(opts, trace_start, "transcript accepted retry prompt; waiting on claude API");
                     } else {
                         setLastApiErrorMessage(failed_attempts, turn.text);
@@ -1263,7 +1288,7 @@ test "appendBracketedPaste frames prompt before separate Enter" {
     try testing.expect(std.mem.indexOf(u8, out.items, "\r") == null);
 }
 
-test "userRecordCount detects post-baseline user record" {
+test "transcript baseline accepts only user records after baseline offset" {
     // AC: prompt-echo-confirmation.transcript-user-record-confirms-submission
     const before =
         \\{"type":"user","sessionId":"s","message":{"content":[{"type":"text","text":"prior"}]}}
@@ -1276,9 +1301,11 @@ test "userRecordCount detects post-baseline user record" {
         \\{"type":"user","sessionId":"s","message":{"content":[{"type":"text","text":"live"}]}}
         \\
     ;
-    const baseline = try userRecordCount(testing.allocator, before);
-    try testing.expectEqual(@as(u32, 1), baseline);
-    try testing.expect((try userRecordCount(testing.allocator, after)) > baseline);
+    const baseline = try transcriptUserBaseline(testing.allocator, before);
+    try testing.expectEqual(@as(u32, 1), baseline.user_records);
+    try testing.expectEqual(@as(u64, before.len), baseline.bytes_len);
+    try testing.expectEqual(baseline.user_records, try userRecordCount(testing.allocator, after[0..baseline.bytes_len]));
+    try testing.expect((try userRecordCount(testing.allocator, after[baseline.bytes_len..])) > 0);
 }
 
 test "replayed echo or paste marker does not confirm without transcript user record" {

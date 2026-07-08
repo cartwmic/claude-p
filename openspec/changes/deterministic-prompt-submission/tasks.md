@@ -42,6 +42,8 @@
   - intent: fix
   - files_allowed:
       - src/driver.zig
+      - src/args.zig
+      - src/main.zig
       - README.md
   - allow_new_files: false
 
