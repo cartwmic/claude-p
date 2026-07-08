@@ -583,11 +583,13 @@ fn waitForTranscriptUserRecord(
     opts: Options,
     trace_start: i128,
     shared: *SharedState,
+    session: anytype,
     path: ?[]const u8,
     baseline: TranscriptUserBaseline,
     prompt_ids: *std.StringHashMap(void),
 ) RunError!void {
     while (true) {
+        try flushPendingToPty(allocator, shared, session);
         if (transcriptHasNewUserRecord(allocator, path, baseline, prompt_ids)) {
             trace(opts, trace_start, "transcript user-record acceptance confirmed");
             return;
@@ -601,6 +603,20 @@ fn clearRecent(shared: *SharedState) void {
     shared.recent_mutex.lock();
     shared.recent.clearRetainingCapacity();
     shared.recent_mutex.unlock();
+}
+
+fn flushPendingToPty(allocator: std.mem.Allocator, shared: *SharedState, session: anytype) !void {
+    shared.write_mutex.lock();
+    const to_write = if (shared.pending_to_pty.items.len > 0)
+        try allocator.dupe(u8, shared.pending_to_pty.items)
+    else
+        null;
+    if (to_write != null) shared.pending_to_pty.clearRetainingCapacity();
+    shared.write_mutex.unlock();
+    if (to_write) |bytes| {
+        session.writeInput(bytes) catch {};
+        allocator.free(bytes);
+    }
 }
 
 /// True if an absolute path exists and is accessible. Used to poll for the
@@ -622,8 +638,9 @@ fn inputReadyFromPty(bytes: []const u8) bool {
 /// an event wait, not a liveness timeout: the driver never "types anyway" based
 /// on elapsed time. If the child exits before readiness, surface the terminal
 /// spawn failure instead of racing a dead input surface.
-fn waitForInputReadiness(opts: Options, trace_start: i128, shared: *SharedState) RunError!void {
+fn waitForInputReadiness(allocator: std.mem.Allocator, opts: Options, trace_start: i128, shared: *SharedState, session: anytype) RunError!void {
     while (true) {
+        try flushPendingToPty(allocator, shared, session);
         if (shared.input_ready.load(.seq_cst)) {
             trace(opts, trace_start, "input readiness confirmed (ESC[?2004h seen)");
             return;
@@ -925,7 +942,7 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
                     std.Thread.sleep(ink_enter_debounce_ms * std.time.ns_per_ms);
                     session.send("", true) catch {};
                     trace(opts, trace_start, "MCP surface ready; Enter sent; waiting for transcript user-record acceptance");
-                    try waitForTranscriptUserRecord(allocator, opts, trace_start, &shared, transcript_path, baseline_user_record, &baseline_user_prompt_ids);
+                    try waitForTranscriptUserRecord(allocator, opts, trace_start, &shared, session, transcript_path, baseline_user_record, &baseline_user_prompt_ids);
                     trace(opts, trace_start, "transcript accepted prompt; waiting on claude API");
                     state = .awaiting_stop;
                 }
@@ -933,17 +950,7 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
         }
 
         // Flush any DEC-responder bytes back to the PTY.
-        shared.write_mutex.lock();
-        const to_write = if (shared.pending_to_pty.items.len > 0)
-            try allocator.dupe(u8, shared.pending_to_pty.items)
-        else
-            null;
-        if (to_write != null) shared.pending_to_pty.clearRetainingCapacity();
-        shared.write_mutex.unlock();
-        if (to_write) |bytes| {
-            session.writeInput(bytes) catch {};
-            allocator.free(bytes);
-        }
+        try flushPendingToPty(allocator, &shared, session);
 
         // Workspace-trust dialog detection. Claude shows a "Is this a project
         // you trust?" prompt in unfamiliar directories that blocks startup
@@ -999,7 +1006,7 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
                                 // Code has enabled bracketed paste for the live
                                 // prompt box; until then, prompt bytes can be
                                 // dropped by the not-yet-ready TUI.
-                                try waitForInputReadiness(opts, trace_start, &shared);
+                                try waitForInputReadiness(allocator, opts, trace_start, &shared, session);
 
                                 traceFmt(opts, trace_start, "pasting prompt ({d} bytes)", .{opts.prompt.len});
                                 writeBracketedPaste(session, opts.prompt) catch {};
@@ -1020,7 +1027,7 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
                                     std.Thread.sleep(ink_enter_debounce_ms * std.time.ns_per_ms);
                                     session.send("", true) catch {};
                                     trace(opts, trace_start, "Enter sent; waiting for transcript user-record acceptance");
-                                    try waitForTranscriptUserRecord(allocator, opts, trace_start, &shared, transcript_path, baseline_user_record, &baseline_user_prompt_ids);
+                                    try waitForTranscriptUserRecord(allocator, opts, trace_start, &shared, session, transcript_path, baseline_user_record, &baseline_user_prompt_ids);
                                     trace(opts, trace_start, "transcript accepted prompt; waiting on claude API");
                                     state = .awaiting_stop;
                                 }
@@ -1124,7 +1131,7 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
                         std.Thread.sleep(ink_enter_debounce_ms * std.time.ns_per_ms);
                         session.send("", true) catch {};
                         trace(opts, trace_start, "retry Enter sent; waiting for transcript user-record acceptance");
-                        try waitForTranscriptUserRecord(allocator, opts, trace_start, &shared, transcript_path, baseline_user_record, &baseline_user_prompt_ids);
+                        try waitForTranscriptUserRecord(allocator, opts, trace_start, &shared, session, transcript_path, baseline_user_record, &baseline_user_prompt_ids);
                         trace(opts, trace_start, "transcript accepted retry prompt; waiting on claude API");
                     } else {
                         setLastApiErrorMessage(failed_attempts, turn.text);

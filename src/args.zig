@@ -278,10 +278,14 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) ParseError!
             // Remote Control is a cloud-relayed/device-enrolled path and not a
             // local deterministic input channel for this interactive driver.
             return ParseError.UnsupportedFlag;
-        } else if (std.mem.eql(u8, a, "--settings")) {
+        } else if (std.mem.eql(u8, a, "--settings") or std.mem.startsWith(u8, a, "--settings=")) {
             // We inject our own --settings with the SessionStart/Stop hooks.
             // Accepting a user --settings would clobber that and break the
             // completion signal.
+            return ParseError.UnsupportedFlag;
+        } else if (std.mem.eql(u8, a, "--input-format") or std.mem.startsWith(u8, a, "--input-format=")) {
+            // Native stream-json input only belongs to Claude print mode; this
+            // wrapper intentionally drives the interactive TUI quota path.
             return ParseError.UnsupportedFlag;
         } else if (std.mem.startsWith(u8, a, "--")) {
             // Unknown long option — forward verbatim. For known boolean
@@ -572,6 +576,12 @@ test "parse: rejects remote-control" {
 
 test "parse: rejects user --settings (conflicts with our hook injection)" {
     try testing.expectError(ParseError.UnsupportedFlag, parse(testing.allocator, &.{ "--settings", "{}" }));
+    try testing.expectError(ParseError.UnsupportedFlag, parse(testing.allocator, &.{ "--settings={}", "hi" }));
+}
+
+test "parse: rejects native input-format" {
+    try testing.expectError(ParseError.UnsupportedFlag, parse(testing.allocator, &.{ "--input-format", "stream-json", "hi" }));
+    try testing.expectError(ParseError.UnsupportedFlag, parse(testing.allocator, &.{ "--input-format=stream-json", "hi" }));
 }
 
 test "parse: stream-json without --verbose is rejected (matches claude -p)" {
