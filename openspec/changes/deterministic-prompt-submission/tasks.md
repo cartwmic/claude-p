@@ -5,7 +5,7 @@
   - files_allowed:
       - openspec/constitution.md
   - allow_new_files: false
-- [ ] 1.2 Restate `openspec/domain.md` prompt-submission invariants for readiness-gated bracketed-paste delivery and transcript user-record acceptance.
+- [x] 1.2 Restate `openspec/domain.md` prompt-submission invariants for readiness-gated bracketed-paste delivery and transcript user-record acceptance.
   - intent: feature
   - files_allowed:
       - openspec/domain.md
