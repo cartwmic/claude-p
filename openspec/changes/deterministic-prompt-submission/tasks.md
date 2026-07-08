@@ -71,12 +71,12 @@
 
 ## 4. Validation and bridge follow-up
 
-- [ ] 4.1 Run `zig build test`, `zig build -Doptimize=ReleaseSafe`, `openspec validate deterministic-prompt-submission --strict`, and `openspec validate --specs --strict`; record results in `verify.md`.
+- [x] 4.1 Run `zig build test`, `zig build -Doptimize=ReleaseSafe`, `openspec validate deterministic-prompt-submission --strict`, and `openspec validate --specs --strict`; record results in `verify.md`.
   - intent: infra
   - files_allowed:
       - openspec/changes/deterministic-prompt-submission/verify.md
   - allow_new_files: true
-- [ ] 4.2 Record the downstream `pi-claude-bridge` pin/guard/scenario follow-up without implementing it in this change.
+- [x] 4.2 Record the downstream `pi-claude-bridge` pin/guard/scenario follow-up without implementing it in this change.
   - intent: infra
   - files_allowed:
       - openspec/changes/deterministic-prompt-submission/follow-ups.md
