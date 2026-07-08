@@ -517,7 +517,10 @@ fn hasNewUserPromptId(allocator: std.mem.Allocator, bytes: []const u8, baseline:
         if (root != .object) continue;
         const obj = root.object;
         if (!isUserRecordObject(obj)) continue;
-        const pid = userPromptId(obj) orelse return !baseline.file_existed;
+        const pid = userPromptId(obj) orelse {
+            if (!baseline.file_existed) return true;
+            continue;
+        };
         if (!prompt_ids.contains(pid)) return true;
     }
     return false;
@@ -1399,6 +1402,25 @@ test "transcript baseline accepts only user records after baseline offset" {
     try testing.expectEqual(@as(u64, before.len), baseline.bytes_len);
     try testing.expectEqual(baseline.user_records, try userRecordCount(testing.allocator, after[0..baseline.bytes_len]));
     try testing.expect(try hasNewUserPromptId(testing.allocator, after[baseline.bytes_len..], baseline, &prompt_ids));
+}
+
+test "promptId-less warm-resume tool result does not hide later live prompt" {
+    // AC: prompt-echo-confirmation.transcript-user-record-confirms-submission
+    const before =
+        \\{"promptId":"p1","type":"user","sessionId":"s","message":{"content":[{"type":"text","text":"prior"}]}}
+        \\{"type":"assistant","sessionId":"s","message":{"content":[{"type":"tool_use","id":"t1","name":"x"}]}}
+        \\
+    ;
+    const after = before ++
+        \\{"type":"user","sessionId":"s","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}
+        \\{"promptId":"p2","type":"user","sessionId":"s","message":{"content":[{"type":"text","text":"live"}]}}
+        \\
+    ;
+    var prompt_ids = std.StringHashMap(void).init(testing.allocator);
+    defer prompt_ids.deinit();
+    defer clearPromptIds(testing.allocator, &prompt_ids);
+    const baseline = try transcriptUserBaseline(testing.allocator, before, &prompt_ids);
+    try testing.expect(try hasNewUserPromptId(testing.allocator, after, baseline, &prompt_ids));
 }
 
 test "replayed echo or paste marker does not confirm without transcript user record" {

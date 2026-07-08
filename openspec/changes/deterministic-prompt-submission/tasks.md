@@ -44,6 +44,7 @@
       - src/driver.zig
       - src/args.zig
       - src/main.zig
+      - tests/integration.zig
       - README.md
   - allow_new_files: false
 

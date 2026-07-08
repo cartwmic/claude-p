@@ -19,7 +19,6 @@ test "real claude: text output for trivial prompt" {
     var result = try claude_p.run(std.testing.allocator, .{
         .prompt = "Reply with the single word OK and nothing else.",
         .output_format = .text,
-        .timeout_ms = 90_000,
         .skip_permissions = true,
     });
     defer result.deinit(std.testing.allocator);
@@ -34,7 +33,6 @@ test "real claude: json output round-trips through std.json" {
     var result = try claude_p.run(std.testing.allocator, .{
         .prompt = "Reply with the single word OK and nothing else.",
         .output_format = .json,
-        .timeout_ms = 90_000,
         .skip_permissions = true,
     });
     defer result.deinit(std.testing.allocator);
@@ -55,7 +53,6 @@ test "real claude: exit code 0 on success" {
     if (!e2eEnabled()) return error.SkipZigTest;
     var result = try claude_p.run(std.testing.allocator, .{
         .prompt = "Reply with OK.",
-        .timeout_ms = 90_000,
         .skip_permissions = true,
     });
     defer result.deinit(std.testing.allocator);
@@ -72,7 +69,6 @@ test "real claude: stream-json arrives as JSONL ending in a result line" {
     var result = try claude_p.run(std.testing.allocator, .{
         .prompt = "Reply with the single word OK.",
         .output_format = .stream_json,
-        .timeout_ms = 90_000,
         .skip_permissions = true,
         .verbose = true,
         .stream_writer = &aw.writer,
