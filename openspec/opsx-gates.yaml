@@ -1,0 +1,15 @@
+# opsx-gates.yaml — deterministic validation manifest for opsx gate.
+# Commands run with cwd = implementation worktree.
+gates:
+  - id: zig-test
+    run: zig build test
+    required: true
+  - id: zig-release-safe
+    run: zig build -Doptimize=ReleaseSafe
+    required: true
+  - id: openspec-change
+    run: openspec validate "$OPSX_CHANGE" --strict
+    required: true
+  - id: openspec-specs
+    run: openspec validate --specs --strict
+    required: true

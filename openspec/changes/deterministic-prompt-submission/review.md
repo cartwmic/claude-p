@@ -39,9 +39,9 @@ review_budget_mode: quiet-round
 
 ## Diff Base + Worktree locator
 
-**Diff Base SHA:** <empty until apply captures it>
-**Worktree Path:** <empty until apply captures it>
-**Integration Branch:** <detected-at-capture>
+**Diff Base SHA:** 3fdbcd3923f54b55f7e3a5f6dce7cb20224b686f
+**Worktree Path:** /Volumes/Workshop/git/claude-p--opsx-deterministic-prompt-submission
+**Integration Branch:** main
 
 ## Manual Adjustments
 
@@ -53,6 +53,7 @@ review_budget_mode: quiet-round
 
 - 2026-07-07 — Intent is frozen at commit `124926b902ba52c8e5a7e725ecc7d714d8689ef7`; do not edit `intent.md` without owner re-authorization.
 - 2026-07-07 — Standing no-liveness-timeouts principle applies: no submission/acceptance wall-clock caps; waits are event waits only.
+- 2026-07-07 — Worktree captured by `opsx worktree ensure deterministic-prompt-submission`: base `3fdbcd3923f54b55f7e3a5f6dce7cb20224b686f`, path `/Volumes/Workshop/git/claude-p--opsx-deterministic-prompt-submission`, integration branch `main`.
 
 ## Scope Expansions
 
