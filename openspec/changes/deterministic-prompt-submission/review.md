@@ -39,7 +39,7 @@ review_budget_mode: quiet-round
 
 ## Diff Base + Worktree locator
 
-**Diff Base SHA:** 79d258e434b6a2bde9f34adf0f28b7f5a6c82c88
+**Diff Base SHA:** 3fdbcd3923f54b55f7e3a5f6dce7cb20224b686f
 **Worktree Path:** /Volumes/Workshop/git/claude-p--opsx-deterministic-prompt-submission
 **Integration Branch:** main
 

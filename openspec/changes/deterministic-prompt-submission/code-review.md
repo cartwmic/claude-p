@@ -4,8 +4,8 @@
 **Verdict:** pass
 **review_mode:** adversarial-multimodel
 **reviewer-provenance:** pi-subagents reviewer output `/tmp/deterministic-prompt-submission-post-rebase-review.md` (openai-codex/gpt-5.5), after prior adversarial multimodel rounds `/Users/cartwmic/tmp/deterministic-prompt-submission-review10-opus.md` and `/Users/cartwmic/tmp/deterministic-prompt-submission-review10-gpt55.md`
-**Diff Base SHA:** 79d258e434b6a2bde9f34adf0f28b7f5a6c82c88
-**Reviewed Range:** 79d258e434b6a2bde9f34adf0f28b7f5a6c82c88..21e4fe5d7975c23f1ad5f6751fc1256bce477918
+**Diff Base SHA:** 3fdbcd3923f54b55f7e3a5f6dce7cb20224b686f
+**Reviewed Range:** 3fdbcd3923f54b55f7e3a5f6dce7cb20224b686f..21e4fe5d7975c23f1ad5f6751fc1256bce477918
 **Attested HEAD:** 21e4fe5d7975c23f1ad5f6751fc1256bce477918
 **Baseline:** intent.md + proposal + specs + constitution + domain + plan + tasks status + verify
 **Generated:** 2026-07-08
@@ -54,4 +54,4 @@ Gating FAIL only for frozen-baseline violation or objective correctness/security
 
 ## Verdict rationale
 
-Post-rebase blind reviewer attested worktree HEAD `21e4fe5d7975c23f1ad5f6751fc1256bce477918` and returned `PASS` for reviewed range `79d258e434b6a2bde9f34adf0f28b7f5a6c82c88..21e4fe5d7975c23f1ad5f6751fc1256bce477918`. No open P0/P1 remain. Code review is sealed pass.
+Post-rebase blind reviewer attested worktree HEAD `21e4fe5d7975c23f1ad5f6751fc1256bce477918` and returned `PASS` for current rebased tree; artifact reviewed range is recorded against frozen diff base `3fdbcd3923f54b55f7e3a5f6dce7cb20224b686f..21e4fe5d7975c23f1ad5f6751fc1256bce477918` per opsx gate contract. No open P0/P1 remain. Code review is sealed pass.
