@@ -518,7 +518,7 @@ fn hasNewUserPromptId(allocator: std.mem.Allocator, bytes: []const u8, baseline:
         const obj = root.object;
         if (!isUserRecordObject(obj)) continue;
         const pid = userPromptId(obj) orelse {
-            if (!baseline.file_existed) return true;
+            if (baseline.allow_promptless_user) return true;
             continue;
         };
         if (!prompt_ids.contains(pid)) return true;
@@ -530,6 +530,7 @@ const TranscriptUserBaseline = struct {
     file_existed: bool = false,
     bytes_len: u64 = 0,
     user_records: u32 = 0,
+    allow_promptless_user: bool = false,
 };
 
 fn transcriptUserBaseline(allocator: std.mem.Allocator, bytes: []const u8, prompt_ids: *std.StringHashMap(void)) !TranscriptUserBaseline {
@@ -566,8 +567,10 @@ fn captureTranscriptUserBaseline(
     path: ?[]const u8,
     prompt_ids: *std.StringHashMap(void),
 ) TranscriptUserBaseline {
-    const baseline = transcriptUserBaselineFile(allocator, path, prompt_ids);
-    traceFmt(opts, trace_start, "transcript user baseline captured: existed={}, bytes={d}, user_records={d}", .{ baseline.file_existed, baseline.bytes_len, baseline.user_records });
+    var baseline = transcriptUserBaselineFile(allocator, path, prompt_ids);
+    const fresh_prompt_turn = opts.resume_session == null and !opts.cont and opts.session_id == null;
+    baseline.allow_promptless_user = fresh_prompt_turn and baseline.user_records == 0;
+    traceFmt(opts, trace_start, "transcript user baseline captured: existed={}, bytes={d}, user_records={d}, allow_promptless={}", .{ baseline.file_existed, baseline.bytes_len, baseline.user_records, baseline.allow_promptless_user });
     return baseline;
 }
 
@@ -1371,7 +1374,7 @@ test "appendBracketedPaste frames prompt before separate Enter" {
 
 test "missing transcript baseline does not block fresh-session acceptance" {
     // AC: prompt-echo-confirmation.transcript-user-record-confirms-submission
-    const baseline: TranscriptUserBaseline = .{};
+    const baseline: TranscriptUserBaseline = .{ .allow_promptless_user = true };
     try testing.expect(!baseline.file_existed);
     const first_write =
         \\{"type":"user","sessionId":"s","message":{"content":[{"type":"text","text":"fresh"}]}}
@@ -1404,6 +1407,19 @@ test "transcript baseline accepts only user records after baseline offset" {
     try testing.expect(try hasNewUserPromptId(testing.allocator, after[baseline.bytes_len..], baseline, &prompt_ids));
 }
 
+test "promptId-less user record is ignored unless fresh promptless acceptance is allowed" {
+    // AC: prompt-echo-confirmation.replayed-history-does-not-confirm-submission
+    const promptless =
+        \\{"type":"user","sessionId":"s","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}
+        \\
+    ;
+    var prompt_ids = std.StringHashMap(void).init(testing.allocator);
+    defer prompt_ids.deinit();
+    defer clearPromptIds(testing.allocator, &prompt_ids);
+    try testing.expect(!(try hasNewUserPromptId(testing.allocator, promptless, .{}, &prompt_ids)));
+    try testing.expect(try hasNewUserPromptId(testing.allocator, promptless, .{ .allow_promptless_user = true }, &prompt_ids));
+}
+
 test "promptId-less warm-resume tool result does not hide later live prompt" {
     // AC: prompt-echo-confirmation.transcript-user-record-confirms-submission
     const before =
@@ -1420,6 +1436,7 @@ test "promptId-less warm-resume tool result does not hide later live prompt" {
     defer prompt_ids.deinit();
     defer clearPromptIds(testing.allocator, &prompt_ids);
     const baseline = try transcriptUserBaseline(testing.allocator, before, &prompt_ids);
+    try testing.expect(!baseline.allow_promptless_user);
     try testing.expect(try hasNewUserPromptId(testing.allocator, after, baseline, &prompt_ids));
 }
 
