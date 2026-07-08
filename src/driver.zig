@@ -566,9 +566,13 @@ fn captureTranscriptUserBaseline(
     trace_start: i128,
     path: ?[]const u8,
     prompt_ids: *std.StringHashMap(void),
-) TranscriptUserBaseline {
+) RunError!TranscriptUserBaseline {
     var baseline = transcriptUserBaselineFile(allocator, path, prompt_ids);
     const fresh_prompt_turn = opts.resume_session == null and !opts.cont and opts.session_id == null;
+    if (!fresh_prompt_turn and !baseline.file_existed) {
+        trace(opts, trace_start, "non-fresh transcript baseline unavailable before submit — failing closed");
+        return RunError.TranscriptUnavailable;
+    }
     baseline.allow_promptless_user = fresh_prompt_turn and baseline.user_records == 0;
     traceFmt(opts, trace_start, "transcript user baseline captured: existed={}, bytes={d}, user_records={d}, allow_promptless={}", .{ baseline.file_existed, baseline.bytes_len, baseline.user_records, baseline.allow_promptless_user });
     return baseline;
@@ -1005,7 +1009,7 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
                                 // turn; the live prompt must create a new user record
                                 // before any assistant Stop/result is trusted.
                                 baseline_turns = transcript_mod.turnCountFile(allocator, transcript_path);
-                                baseline_user_record = captureTranscriptUserBaseline(allocator, opts, trace_start, transcript_path, &baseline_user_prompt_ids);
+                                baseline_user_record = try captureTranscriptUserBaseline(allocator, opts, trace_start, transcript_path, &baseline_user_prompt_ids);
                                 baseline_usage = transcript_mod.usageFile(allocator, transcript_path);
                                 traceFmt(opts, trace_start, "submit baselines before Enter: assistant_turns={d}, user_records={d}, bytes={d}", .{ baseline_turns, baseline_user_record.user_records, baseline_user_record.bytes_len });
 
@@ -1110,7 +1114,7 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
                         std.Thread.sleep(backoff_ms * std.time.ns_per_ms);
 
                         baseline_turns = transcript_mod.turnCountFile(allocator, transcript_path);
-                        baseline_user_record = captureTranscriptUserBaseline(allocator, opts, trace_start, transcript_path, &baseline_user_prompt_ids);
+                        baseline_user_record = try captureTranscriptUserBaseline(allocator, opts, trace_start, transcript_path, &baseline_user_prompt_ids);
                         baseline_usage = transcript_mod.usageFile(allocator, transcript_path);
                         traceFmt(opts, trace_start, "submit baselines reset after API error: assistant_turns={d}, user_records={d}, bytes={d}", .{ baseline_turns, baseline_user_record.user_records, baseline_user_record.bytes_len });
 
@@ -1370,6 +1374,23 @@ test "appendBracketedPaste frames prompt before separate Enter" {
     try appendBracketedPaste(testing.allocator, &out, "hello\nworld");
     try testing.expectEqualStrings("\x1b[200~hello\nworld\x1b[201~", out.items);
     try testing.expect(std.mem.indexOf(u8, out.items, "\r") == null);
+}
+
+test "non-fresh missing transcript baseline fails closed" {
+    // AC: prompt-echo-confirmation.replayed-history-does-not-confirm-submission
+    var prompt_ids = std.StringHashMap(void).init(testing.allocator);
+    defer prompt_ids.deinit();
+    defer clearPromptIds(testing.allocator, &prompt_ids);
+    try testing.expectError(
+        RunError.TranscriptUnavailable,
+        captureTranscriptUserBaseline(
+            testing.allocator,
+            .{ .prompt = "x", .resume_session = "sid" },
+            0,
+            null,
+            &prompt_ids,
+        ),
+    );
 }
 
 test "missing transcript baseline does not block fresh-session acceptance" {
