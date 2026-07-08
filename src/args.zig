@@ -236,7 +236,7 @@ pub fn parse(allocator: std.mem.Allocator, argv: []const []const u8) ParseError!
             opts.verbose = true;
         } else if (std.mem.eql(u8, a, "--debug")) {
             opts.debug = true;
-        } else if (std.mem.eql(u8, a, "--timeout")) {
+        } else if (std.mem.eql(u8, a, "--timeout") or std.mem.startsWith(u8, a, "--timeout=")) {
             return ParseError.UnsupportedFlag;
         } else if (std.mem.eql(u8, a, "--system-prompt")) {
             i += 1;
@@ -417,6 +417,7 @@ test "parse: --version" {
 
 test "parse: --timeout is rejected" {
     try testing.expectError(ParseError.UnsupportedFlag, parse(testing.allocator, &.{ "--timeout", "60", "hi" }));
+    try testing.expectError(ParseError.UnsupportedFlag, parse(testing.allocator, &.{ "--timeout=60", "hi" }));
 }
 
 test "parse: --resume value" {

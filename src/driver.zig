@@ -451,24 +451,26 @@ fn userRecordCount(allocator: std.mem.Allocator, bytes: []const u8) !u32 {
 }
 
 const TranscriptUserBaseline = struct {
+    file_existed: bool = false,
     bytes_len: u64 = 0,
     user_records: u32 = 0,
 };
 
 fn transcriptUserBaseline(allocator: std.mem.Allocator, bytes: []const u8) !TranscriptUserBaseline {
     return .{
+        .file_existed = true,
         .bytes_len = bytes.len,
         .user_records = try userRecordCount(allocator, bytes),
     };
 }
 
-fn transcriptUserBaselineFile(allocator: std.mem.Allocator, path: ?[]const u8) ?TranscriptUserBaseline {
-    const p = path orelse return null;
-    const file = std.fs.cwd().openFile(p, .{}) catch return null;
+fn transcriptUserBaselineFile(allocator: std.mem.Allocator, path: ?[]const u8) TranscriptUserBaseline {
+    const p = path orelse return .{};
+    const file = std.fs.cwd().openFile(p, .{}) catch return .{};
     defer file.close();
-    const bytes = file.readToEndAlloc(allocator, 64 * 1024 * 1024) catch return null;
+    const bytes = file.readToEndAlloc(allocator, 64 * 1024 * 1024) catch return .{};
     defer allocator.free(bytes);
-    return transcriptUserBaseline(allocator, bytes) catch null;
+    return transcriptUserBaseline(allocator, bytes) catch .{};
 }
 
 fn transcriptHasNewUserRecord(allocator: std.mem.Allocator, path: ?[]const u8, baseline: TranscriptUserBaseline) bool {
@@ -482,21 +484,15 @@ fn transcriptHasNewUserRecord(allocator: std.mem.Allocator, path: ?[]const u8, b
     return (userRecordCount(allocator, bytes[start..]) catch 0) > 0;
 }
 
-fn waitForTranscriptUserBaseline(
+fn captureTranscriptUserBaseline(
     allocator: std.mem.Allocator,
     opts: Options,
     trace_start: i128,
-    shared: *SharedState,
     path: ?[]const u8,
-) RunError!TranscriptUserBaseline {
-    while (true) {
-        if (transcriptUserBaselineFile(allocator, path)) |baseline| {
-            traceFmt(opts, trace_start, "transcript user baseline captured: bytes={d}, user_records={d}", .{ baseline.bytes_len, baseline.user_records });
-            return baseline;
-        }
-        if (shared.exited.load(.seq_cst)) return RunError.TranscriptUnavailable;
-        std.Thread.sleep(15 * std.time.ns_per_ms);
-    }
+) TranscriptUserBaseline {
+    const baseline = transcriptUserBaselineFile(allocator, path);
+    traceFmt(opts, trace_start, "transcript user baseline captured: existed={}, bytes={d}, user_records={d}", .{ baseline.file_existed, baseline.bytes_len, baseline.user_records });
+    return baseline;
 }
 
 fn waitForTranscriptUserRecord(
@@ -663,6 +659,9 @@ fn onZmuxEvent(ctx: *anyopaque, event: zmux.native.Event) void {
             // detection in the main loop.
             shared.recent_mutex.lock();
             shared.recent.appendSlice(std.heap.page_allocator, po.data) catch {};
+            if (!shared.input_ready.load(.seq_cst) and inputReadyFromPty(shared.recent.items)) {
+                shared.input_ready.store(true, .seq_cst);
+            }
             if (shared.recent.items.len > recent_capacity) {
                 const drop = shared.recent.items.len - recent_capacity;
                 std.mem.copyForwards(
@@ -923,7 +922,7 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
                                 // turn; the live prompt must create a new user record
                                 // before any assistant Stop/result is trusted.
                                 baseline_turns = transcript_mod.turnCountFile(allocator, transcript_path);
-                                baseline_user_record = try waitForTranscriptUserBaseline(allocator, opts, trace_start, &shared, transcript_path);
+                                baseline_user_record = captureTranscriptUserBaseline(allocator, opts, trace_start, transcript_path);
                                 baseline_usage = transcript_mod.usageFile(allocator, transcript_path);
                                 traceFmt(opts, trace_start, "submit baselines before Enter: assistant_turns={d}, user_records={d}, bytes={d}", .{ baseline_turns, baseline_user_record.user_records, baseline_user_record.bytes_len });
 
@@ -1028,7 +1027,7 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
                         std.Thread.sleep(backoff_ms * std.time.ns_per_ms);
 
                         baseline_turns = transcript_mod.turnCountFile(allocator, transcript_path);
-                        baseline_user_record = try waitForTranscriptUserBaseline(allocator, opts, trace_start, &shared, transcript_path);
+                        baseline_user_record = captureTranscriptUserBaseline(allocator, opts, trace_start, transcript_path);
                         baseline_usage = transcript_mod.usageFile(allocator, transcript_path);
                         traceFmt(opts, trace_start, "submit baselines reset after API error: assistant_turns={d}, user_records={d}, bytes={d}", .{ baseline_turns, baseline_user_record.user_records, baseline_user_record.bytes_len });
 
@@ -1276,7 +1275,9 @@ const testing = std.testing;
 test "input readiness requires bracketed-paste enable sentinel" {
     // AC: prompt-echo-confirmation.prompt-delivery-readiness-is-event-gated
     try testing.expect(!inputReadyFromPty("booting..."));
+    try testing.expect(!inputReadyFromPty("\x1b[?20"));
     try testing.expect(inputReadyFromPty("booting...\x1b[?2004hready"));
+    try testing.expect(inputReadyFromPty("\x1b[?20" ++ "04h"));
 }
 
 test "appendBracketedPaste frames prompt before separate Enter" {
@@ -1286,6 +1287,17 @@ test "appendBracketedPaste frames prompt before separate Enter" {
     try appendBracketedPaste(testing.allocator, &out, "hello\nworld");
     try testing.expectEqualStrings("\x1b[200~hello\nworld\x1b[201~", out.items);
     try testing.expect(std.mem.indexOf(u8, out.items, "\r") == null);
+}
+
+test "missing transcript baseline does not block fresh-session acceptance" {
+    // AC: prompt-echo-confirmation.transcript-user-record-confirms-submission
+    const baseline: TranscriptUserBaseline = .{};
+    try testing.expect(!baseline.file_existed);
+    const first_write =
+        \\{"type":"user","sessionId":"s","message":{"content":[{"type":"text","text":"fresh"}]}}
+        \\
+    ;
+    try testing.expect((try userRecordCount(testing.allocator, first_write[baseline.bytes_len..])) > 0);
 }
 
 test "transcript baseline accepts only user records after baseline offset" {
